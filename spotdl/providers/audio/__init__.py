@@ -9,6 +9,7 @@ from spotdl.providers.audio.base import (
     AudioProviderError,
     YTDLLogger,
 )
+from spotdl.providers.audio.pesnime import PesniMe
 from spotdl.providers.audio.piped import Piped
 from spotdl.providers.audio.soundcloud import SoundCloud
 from spotdl.providers.audio.youtube import YouTube
@@ -20,6 +21,7 @@ __all__ = [
     "SoundCloud",
     "BandCamp",
     "Piped",
+    "PesniMe",
     "AudioProvider",
     "AudioProviderError",
     "YTDLLogger",

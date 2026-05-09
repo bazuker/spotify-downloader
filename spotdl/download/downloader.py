@@ -21,6 +21,7 @@ from spotdl.download.progress_handler import ProgressHandler
 from spotdl.providers.audio import (
     AudioProvider,
     BandCamp,
+    PesniMe,
     Piped,
     SoundCloud,
     YouTube,
@@ -59,6 +60,7 @@ AUDIO_PROVIDERS: Dict[str, Type[AudioProvider]] = {
     "soundcloud": SoundCloud,
     "bandcamp": BandCamp,
     "piped": Piped,
+    "pesni-me": PesniMe,
 }
 
 LYRICS_PROVIDERS: Dict[str, Type[LyricsProvider]] = {
