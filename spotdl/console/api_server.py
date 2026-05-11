@@ -16,6 +16,9 @@ the URL.
 """
 
 import logging
+import os
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -25,11 +28,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from spotdl.download.downloader import Downloader
+from spotdl.download.downloader import LYRICS_PROVIDERS, Downloader
 from spotdl.types.options import DownloaderOptions, WebOptions
+from spotdl.types.song import Song
+from spotdl.utils.formatter import create_file_name
+from spotdl.utils.metadata import embed_metadata
 from spotdl.utils.search import get_simple_songs
 
 __all__ = ["api_server"]
@@ -57,6 +63,15 @@ class SubmitRequest(BaseModel):
     """Body of POST /download."""
 
     url: str
+
+
+class EnrichResponse(BaseModel):
+    """Returned by POST /enrich."""
+
+    url: str
+    output_path: str
+    song_name: str
+    song_artist: str
 
 
 class SubmitResponse(BaseModel):
@@ -180,6 +195,37 @@ def api_server(
         ).start()
         return SubmitResponse(job_id=job.id, state=job.state)
 
+    @app.post("/enrich", response_model=EnrichResponse)
+    def enrich(
+        file: UploadFile = File(...),
+        url: str = Form(...),
+    ) -> EnrichResponse:
+        if _kind_from_url(url) != "track":
+            raise HTTPException(
+                status_code=400,
+                detail="URL must be a Spotify track URL",
+            )
+        if not file.filename or not file.filename.lower().endswith(".mp3"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only .mp3 files are supported",
+            )
+
+        fd, tmp_path_str = tempfile.mkstemp(suffix=".mp3", prefix="enrich-")
+        tmp_path = Path(tmp_path_str)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                shutil.copyfileobj(file.file, out)
+            return _enrich_file(tmp_path, url, downloader_settings)
+        finally:
+            # If _enrich_file moved the temp file to its final location this
+            # is a no-op; otherwise we leave nothing behind.
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def status(job_id: str) -> JobStatus:
         job = jobs.get(job_id)
@@ -285,6 +331,91 @@ def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
                 downloader.progress_handler.close()
             except Exception:  # pylint: disable=broad-except
                 pass
+
+
+def _enrich_file(
+    tmp_path: Path, url: str, base_settings: DownloaderOptions
+) -> EnrichResponse:
+    """
+    Move an uploaded mp3 to its rightful place in the music library and embed
+    Spotify-sourced tags + cover + lyrics. No re-encoding, no download — the
+    user's audio is preserved bit-for-bit; only the ID3 frames change.
+    """
+
+    try:
+        song = Song.from_url(url)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=400, detail=f"Failed to resolve Spotify URL: {exc}"
+        ) from exc
+
+    # Best-effort lyrics. Fetch from configured providers but never fail the
+    # enrich if all of them error out — tags + cover already justify the call.
+    song.lyrics = _fetch_lyrics(song, base_settings)
+
+    output_file = create_file_name(
+        song,
+        base_settings["output"],
+        base_settings["format"],
+        base_settings.get("restrict"),
+    )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.move(str(tmp_path), str(output_file))
+
+    try:
+        embed_metadata(
+            output_file,
+            song,
+            id3_separator=base_settings.get("id3_separator", "/"),
+            skip_album_art=bool(base_settings.get("skip_album_art", False)),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=500, detail=f"Failed to embed metadata: {exc}"
+        ) from exc
+
+    logger.info(
+        "enriched %s → %s",
+        song.display_name,
+        output_file,
+    )
+    return EnrichResponse(
+        url=url,
+        output_path=str(output_file),
+        song_name=song.name,
+        song_artist=song.artist,
+    )
+
+
+def _fetch_lyrics(song: Song, settings: DownloaderOptions) -> Optional[str]:
+    """
+    Walk the configured lyrics-provider chain and return the first hit.
+    Swallows provider errors so a single broken provider doesn't sink the
+    whole enrich call.
+    """
+
+    for name in settings.get("lyrics_providers") or []:
+        cls = LYRICS_PROVIDERS.get(name)
+        if cls is None:
+            continue
+        try:
+            provider = (
+                cls(settings["genius_token"])
+                if name == "genius" and settings.get("genius_token")
+                else cls()
+            )
+            lyrics = provider.get_lyrics(song.name, list(song.artists))
+            if lyrics:
+                return lyrics
+        except Exception:  # pylint: disable=broad-except
+            logger.debug(
+                "lyrics provider %s failed for %s",
+                name,
+                song.display_name,
+                exc_info=True,
+            )
+    return None
 
 
 def _apply_dedup_defaults(settings: DownloaderOptions) -> None:

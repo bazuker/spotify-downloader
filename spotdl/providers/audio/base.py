@@ -98,7 +98,7 @@ class AudioProvider:
         elif self.output_format == "opus":
             ytdl_format = "bestaudio[ext=webm]/bestaudio/best"
         else:
-            ytdl_format = "bestaudio"
+            ytdl_format = "bestaudio/best"
 
         yt_dlp_options = {
             "format": ytdl_format,
