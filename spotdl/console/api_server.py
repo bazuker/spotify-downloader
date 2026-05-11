@@ -1,15 +1,25 @@
 """
-api-server operation: a small HTTP wrapper around the Downloader.
+api-server operation: HTTP wrapper around the Downloader that runs downloads
+as background jobs.
 
-Exposes a single endpoint, `POST /download`, that accepts a Spotify URL and
-runs the regular spotdl download pipeline with the server's configured
-settings. When the URL is a Spotify *playlist*, the server additionally
-generates an `.m3u8` playlist file alongside the downloaded audio so that
-Navidrome (or any other tag-aware library) can ingest it.
+Workflow:
+  1. `POST /download {url}` → returns `{job_id, state}` immediately (202).
+  2. `GET /jobs/{job_id}` → returns the current `{state, total, downloaded,
+     errored, skipped, paths, error}`. Poll until `state` is `done`/`failed`.
+
+Single-flight: at most one non-terminal job exists at any time. New
+submissions while one is in progress get 409.
+
+State is in-memory only. A restart loses any in-flight or recently
+completed jobs — for the personal-bot use case that's acceptable; resubmit
+the URL.
 """
 
 import logging
 import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -29,20 +39,115 @@ logger = logging.getLogger(__name__)
 _KNOWN_KINDS = {"track", "album", "playlist", "artist"}
 _ARCHIVE_FILENAME = "musicdon.archive"
 
+# How long terminal (done/failed) jobs stay readable after they finish. Long
+# enough that the bot's poll loop can pick up the final state and include it
+# in its Telegram message; short enough that the in-memory map doesn't bloat
+# over weeks of uptime.
+JOB_RETENTION_SECONDS = 600
 
-class DownloadRequest(BaseModel):
+STATE_QUEUED = "queued"
+STATE_RESOLVING = "resolving"
+STATE_DOWNLOADING = "downloading"
+STATE_DONE = "done"
+STATE_FAILED = "failed"
+_TERMINAL_STATES = {STATE_DONE, STATE_FAILED}
+
+
+class SubmitRequest(BaseModel):
     """Body of POST /download."""
 
     url: str
 
 
-class DownloadResponse(BaseModel):
-    """Returned by POST /download once the pipeline finishes."""
+class SubmitResponse(BaseModel):
+    """Returned by POST /download — the bot polls /jobs/{job_id} from here on."""
 
+    job_id: str
+    state: str
+
+
+class JobStatus(BaseModel):
+    """Returned by GET /jobs/{job_id}."""
+
+    job_id: str
     url: str
     kind: str
-    downloaded: List[str]
-    errors: List[str]
+    state: str
+    total: Optional[int] = None
+    downloaded: int = 0
+    errored: int = 0
+    skipped: int = 0
+    paths: List[str] = []
+    error: Optional[str] = None
+
+
+@dataclass
+class Job:
+    """In-memory progress record for one download."""
+
+    id: str
+    url: str
+    kind: str = "unknown"
+    state: str = STATE_QUEUED
+    total: Optional[int] = None
+    downloaded: int = 0
+    errored: int = 0
+    skipped: int = 0  # already-archived tracks; not counted against `total`
+    paths: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    started_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def is_terminal(self) -> bool:
+        return self.state in _TERMINAL_STATES
+
+
+class JobStore:
+    """
+    In-memory job registry with single-flight enforcement and TTL cleanup.
+
+    Single-flight: at most one non-terminal job at a time. New submissions
+    while one is active raise ValueError, which the endpoint surfaces as
+    HTTP 409.
+    """
+
+    def __init__(self) -> None:
+        self._jobs: Dict[str, Job] = {}
+        self._lock = threading.Lock()
+        self._active_id: Optional[str] = None
+
+    def submit(self, url: str) -> Job:
+        with self._lock:
+            self._gc_locked()
+            if self._active_id is not None:
+                active = self._jobs.get(self._active_id)
+                if active is not None and not active.is_terminal():
+                    raise ValueError("another download is in progress")
+            job_id = uuid.uuid4().hex[:12]
+            job = Job(id=job_id, url=url)
+            self._jobs[job_id] = job
+            self._active_id = job_id
+            return job
+
+    def get(self, job_id: str) -> Optional[Job]:
+        with self._lock:
+            self._gc_locked()
+            return self._jobs.get(job_id)
+
+    def _gc_locked(self) -> None:
+        now = time.time()
+        stale = [
+            jid
+            for jid, j in self._jobs.items()
+            if j.is_terminal()
+            and j.finished_at is not None
+            and (now - j.finished_at) > JOB_RETENTION_SECONDS
+        ]
+        for jid in stale:
+            del self._jobs[jid]
+            if self._active_id == jid:
+                self._active_id = None
 
 
 def api_server(
@@ -51,32 +156,46 @@ def api_server(
 ) -> None:
     """
     Run the api-server. Blocks the calling thread until the process is killed.
-
-    ### Arguments
-    - downloader_settings: defaults applied to every download. The server adds
-      a per-request `m3u` override when the URL is a playlist.
-    - server_settings: WebOptions used for host/port (we reuse the same flags
-      that `spotdl web` already wires up).
     """
 
     _apply_dedup_defaults(downloader_settings)
+    jobs = JobStore()
 
     app = FastAPI(title="spotdl api-server")
-    # Serialize downloads. spotdl's Downloader and a few of its module-level
-    # caches (yt-dlp temp dir, archive file, m3u write) are not safe to run
-    # concurrently within a single process.
-    download_lock = threading.Lock()
 
-    @app.post("/download", response_model=DownloadResponse)
-    def download(req: DownloadRequest) -> DownloadResponse:
-        if not download_lock.acquire(blocking=False):
-            raise HTTPException(
-                status_code=409, detail="another download is in progress"
-            )
+    @app.post("/download", response_model=SubmitResponse, status_code=202)
+    def submit(req: SubmitRequest) -> SubmitResponse:
         try:
-            return _run_download(req.url, downloader_settings)
-        finally:
-            download_lock.release()
+            job = jobs.submit(req.url)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        threading.Thread(
+            target=_run_job,
+            args=(job, downloader_settings),
+            name=f"job-{job.id}",
+            daemon=True,
+        ).start()
+        return SubmitResponse(job_id=job.id, state=job.state)
+
+    @app.get("/jobs/{job_id}", response_model=JobStatus)
+    def status(job_id: str) -> JobStatus:
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        with job.lock:
+            return JobStatus(
+                job_id=job.id,
+                url=job.url,
+                kind=job.kind,
+                state=job.state,
+                total=job.total,
+                downloaded=job.downloaded,
+                errored=job.errored,
+                skipped=job.skipped,
+                paths=list(job.paths),
+                error=job.error,
+            )
 
     host = server_settings.get("host") or "0.0.0.0"
     port = int(server_settings.get("port") or 8800)
@@ -84,51 +203,84 @@ def api_server(
     uvicorn.run(app, host=host, port=port)
 
 
-def _run_download(
-    url: str, base_settings: DownloaderOptions
-) -> DownloadResponse:
-    kind = _kind_from_url(url)
-    per_request: Dict[str, Any] = dict(base_settings)
+def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
+    """Worker thread body for a single download job."""
 
-    m3u_template = _m3u_template_for(url, base_settings["output"])
-    if m3u_template:
-        per_request["m3u"] = m3u_template
-        # spotdl writes the m3u with a plain open() — it doesn't create parent
-        # dirs. Pre-create the playlist directory so the first run succeeds.
-        Path(m3u_template.split("{", 1)[0]).expanduser().mkdir(
-            parents=True, exist_ok=True
+    downloader: Optional[Downloader] = None
+    try:
+        with job.lock:
+            job.kind = _kind_from_url(job.url)
+            job.state = STATE_RESOLVING
+
+        per_request: Dict[str, Any] = dict(base_settings)
+        m3u_template = _m3u_template_for(job.url, base_settings["output"])
+        if m3u_template:
+            per_request["m3u"] = m3u_template
+            Path(m3u_template.split("{", 1)[0]).expanduser().mkdir(
+                parents=True, exist_ok=True
+            )
+
+        downloader = Downloader(per_request)
+
+        songs = get_simple_songs(
+            [job.url],
+            use_ytm_data=downloader.settings["ytm_data"],
+            playlist_numbering=downloader.settings["playlist_numbering"],
+            albums_to_ignore=downloader.settings["ignore_albums"],
+            album_type=downloader.settings["album_type"],
+            playlist_retain_track_cover=downloader.settings[
+                "playlist_retain_track_cover"
+            ],
         )
 
-    downloader = Downloader(per_request)
-    try:
-        try:
-            songs = get_simple_songs(
-                [url],
-                use_ytm_data=downloader.settings["ytm_data"],
-                playlist_numbering=downloader.settings["playlist_numbering"],
-                albums_to_ignore=downloader.settings["ignore_albums"],
-                album_type=downloader.settings["album_type"],
-                playlist_retain_track_cover=downloader.settings[
-                    "playlist_retain_track_cover"
-                ],
+        # `download_multiple_songs` archive-filters before doing any work; we
+        # mirror that filter here so `total` reflects what will actually be
+        # downloaded and the bot's progress bar advances at a sensible pace.
+        archive_skipped = 0
+        if downloader.settings.get("archive") and downloader.url_archive:
+            archive_skipped = sum(
+                1 for s in songs if s.url in downloader.url_archive
             )
-        except Exception as exc:
-            logger.exception("Failed to resolve %s", url)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        with job.lock:
+            job.skipped = archive_skipped
+            job.total = max(0, len(songs) - archive_skipped)
+            job.state = STATE_DOWNLOADING
+
+        # `search_and_download` is the per-song synchronous worker called
+        # from each pool_download coroutine. Wrapping it gives us per-track
+        # progress without reimplementing spotdl's orchestrator.
+        original_search_and_download = downloader.search_and_download
+
+        def tracked_search_and_download(song):
+            result = original_search_and_download(song)
+            with job.lock:
+                if result[1] is not None:
+                    job.downloaded += 1
+                else:
+                    job.errored += 1
+            return result
+
+        downloader.search_and_download = tracked_search_and_download  # type: ignore[assignment]
 
         results = downloader.download_multiple_songs(songs)
 
-        downloaded = [
-            str(path) for _song, path in results if path is not None
-        ]
-        return DownloadResponse(
-            url=url,
-            kind=kind,
-            downloaded=downloaded,
-            errors=list(downloader.errors),
-        )
+        with job.lock:
+            job.paths = [str(p) for _s, p in results if p is not None]
+            job.state = STATE_DONE
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("job %s failed", job.id)
+        with job.lock:
+            job.state = STATE_FAILED
+            job.error = str(exc)
     finally:
-        downloader.progress_handler.close()
+        with job.lock:
+            job.finished_at = time.time()
+        if downloader is not None:
+            try:
+                downloader.progress_handler.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
 
 
 def _apply_dedup_defaults(settings: DownloaderOptions) -> None:
@@ -136,13 +288,10 @@ def _apply_dedup_defaults(settings: DownloaderOptions) -> None:
     Turn on the dedup mechanisms that make sense for a long-running bot, but
     only for keys the user hasn't explicitly set:
 
-    - `archive`: O(1) skip-list of Spotify URLs we've already processed. The
-      bot reruns the same playlist on every refresh, so this is the biggest
-      single win — already-known URLs are filtered before Spotify is hit.
+    - `archive`: O(1) skip-list of Spotify URLs we've already processed.
       Default location lives at the music root next to the audio files.
     - `scan_for_songs`: walks the output tree and reads each file's WOAS ID3
-      tag at startup. Catches duplicates whose filename or path changed
-      since the last run (e.g. after an output-template change).
+      tag at startup, catching duplicates whose filename or path changed.
     """
 
     if not settings.get("archive"):
@@ -184,7 +333,5 @@ def _m3u_template_for(url: str, output_template: str) -> Optional[str]:
     if _kind_from_url(url) != "playlist":
         return None
 
-    # The token-free prefix of the output template is the root music dir.
-    # Example: "/music/{album-artist} - {title}.{output-ext}" → "/music".
     base = output_template.split("{", 1)[0].rstrip("/") or "."
     return f"{base}/Playlists/{{list[0]}}.m3u8"

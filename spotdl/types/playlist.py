@@ -92,13 +92,19 @@ class Playlist(SongList):
 
             track_meta = track["track"]
 
-            if track_meta.get("is_local") or track_meta.get("type") != "track":
+            if track_meta.get("is_local"):
                 logger.warning(
-                    "Skipping track: %s local tracks and %s are not supported",
-                    track_meta.get("id"),
-                    track_meta.get("type"),
+                    "Skipping local track (uploaded by playlist owner, "
+                    "no Spotify metadata): %r",
+                    track_meta.get("name"),
                 )
-
+                continue
+            if track_meta.get("type") != "track":
+                logger.warning(
+                    "Skipping non-track playlist item: type=%s, id=%s",
+                    track_meta.get("type"),
+                    track_meta.get("id"),
+                )
                 continue
 
             track_id = track_meta.get("id")
