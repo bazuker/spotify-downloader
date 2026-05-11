@@ -16,7 +16,7 @@ from spotdl.utils.logging import NAME_TO_LEVEL
 
 __all__ = ["OPERATIONS", "SmartFormatter", "parse_arguments"]
 
-OPERATIONS = ["download", "save", "web", "sync", "meta", "url"]
+OPERATIONS = ["download", "save", "web", "api-server", "sync", "meta", "url"]
 
 
 class SmartFormatter(argparse.HelpFormatter):
@@ -88,20 +88,21 @@ def parse_main_options(parser: _ArgumentGroup):
     )
 
     try:
-        is_web = sys.argv[1] == "web"
+        op_arg = sys.argv[1]
     except IndexError:
-        is_web = False
+        op_arg = ""
+    is_web = op_arg == "web"
+    is_api_server = op_arg == "api-server"
+    is_long_running = is_web or is_api_server
 
     is_frozen = getattr(sys, "frozen", False)
 
-    # If the program is frozen, we and user didn't pass any arguments,
-    # or if the user is using the web interface, we don't need to parse
-    # the query
-    if (is_frozen and len(sys.argv) < 2) or (len(sys.argv) > 1 and is_web):
-        # If we are running the web interface
-        # or we are in the frozen env and not running web interface
-        # don't remove the operation from the arg parser
-        if not is_web or (is_frozen and not is_web):
+    # Long-running server operations (`web`, `api-server`) receive their URLs
+    # over HTTP rather than as CLI positionals, so drop the `query` action so
+    # argparse doesn't demand one. The frozen-without-args path is the
+    # double-click launcher case that drops both `operation` and `query`.
+    if (is_frozen and len(sys.argv) < 2) or (len(sys.argv) > 1 and is_long_running):
+        if not is_long_running or (is_frozen and not is_long_running):
             parser._remove_action(operation)  # pylint: disable=protected-access
 
         parser._remove_action(query)  # pylint: disable=protected-access

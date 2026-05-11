@@ -11,6 +11,7 @@ import sys
 import time
 from argparse import Namespace
 
+from spotdl.console.api_server import api_server
 from spotdl.console.download import download
 from spotdl.console.meta import meta
 from spotdl.console.save import save
@@ -143,6 +144,12 @@ def entry_point():
         # Start web ui
         web(web_settings, downloader_settings)
 
+        return None
+
+    # Start the lightweight HTTP API (one POST /download endpoint). Reuses the
+    # web operation's --host/--port flags via web_settings.
+    if arguments.operation == "api-server":
+        api_server(downloader_settings, web_settings)
         return None
 
     # Check if save file is present and if it's valid
