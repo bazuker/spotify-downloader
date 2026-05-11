@@ -27,6 +27,7 @@ __all__ = ["api_server"]
 logger = logging.getLogger(__name__)
 
 _KNOWN_KINDS = {"track", "album", "playlist", "artist"}
+_ARCHIVE_FILENAME = "musicdon.archive"
 
 
 class DownloadRequest(BaseModel):
@@ -57,6 +58,8 @@ def api_server(
     - server_settings: WebOptions used for host/port (we reuse the same flags
       that `spotdl web` already wires up).
     """
+
+    _apply_dedup_defaults(downloader_settings)
 
     app = FastAPI(title="spotdl api-server")
     # Serialize downloads. spotdl's Downloader and a few of its module-level
@@ -126,6 +129,36 @@ def _run_download(
         )
     finally:
         downloader.progress_handler.close()
+
+
+def _apply_dedup_defaults(settings: DownloaderOptions) -> None:
+    """
+    Turn on the dedup mechanisms that make sense for a long-running bot, but
+    only for keys the user hasn't explicitly set:
+
+    - `archive`: O(1) skip-list of Spotify URLs we've already processed. The
+      bot reruns the same playlist on every refresh, so this is the biggest
+      single win — already-known URLs are filtered before Spotify is hit.
+      Default location lives at the music root next to the audio files.
+    - `scan_for_songs`: walks the output tree and reads each file's WOAS ID3
+      tag at startup. Catches duplicates whose filename or path changed
+      since the last run (e.g. after an output-template change).
+    """
+
+    if not settings.get("archive"):
+        base = settings["output"].split("{", 1)[0].rstrip("/") or "."
+        archive_path = str(Path(base).expanduser() / _ARCHIVE_FILENAME)
+        Path(archive_path).parent.mkdir(parents=True, exist_ok=True)
+        settings["archive"] = archive_path
+        logger.info("dedup: archive enabled at %s", archive_path)
+    else:
+        logger.info("dedup: archive already set to %s", settings["archive"])
+
+    if not settings.get("scan_for_songs"):
+        settings["scan_for_songs"] = True
+        logger.info("dedup: scan_for_songs enabled")
+    else:
+        logger.info("dedup: scan_for_songs already enabled by user")
 
 
 def _kind_from_url(url: str) -> str:

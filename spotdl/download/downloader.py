@@ -287,6 +287,13 @@ class Downloader:
 
         logger.debug("Downloading %d songs", len(songs))
 
+        # Snapshot of the full song list (in playlist order) before the
+        # archive filter prunes it. Needed for m3u generation later: when a
+        # playlist is re-mirrored and every track is already on disk, the
+        # `results` list is empty, but the m3u should still contain the full
+        # playlist contents because the audio files do exist.
+        original_songs = list(songs)
+
         if self.settings["archive"]:
             songs = [song for song in songs if song.url not in self.url_archive]
             logger.debug("Filtered %d songs with archive", len(songs))
@@ -332,11 +339,18 @@ class Downloader:
 
         # Create m3u playlist
         if self.settings["m3u"]:
-            song_list = [
-                song
-                for song, path in results
-                if path or self.settings["add_unavailable"]
-            ]
+            if self.settings["archive"]:
+                # url_archive now contains both pre-existing entries and the
+                # ones just saved above, so this captures every song whose
+                # audio file exists on disk after this run. Iterating the
+                # snapshot preserves the original playlist order.
+                song_list = [s for s in original_songs if s.url in self.url_archive]
+            else:
+                song_list = [
+                    song
+                    for song, path in results
+                    if path or self.settings["add_unavailable"]
+                ]
 
             gen_m3u_files(
                 song_list,
