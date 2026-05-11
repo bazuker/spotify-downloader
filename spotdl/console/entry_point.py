@@ -38,12 +38,13 @@ OPERATIONS = {
 
 logger = logging.getLogger(__name__)
 
-# Environment-variable overrides for Spotify credentials. The pair lets users
-# avoid persisting credentials to ~/.spotdl/config.json — useful for Docker
-# and CI runs where secrets come from the environment.
+# Environment-variable overrides for credentials. Lets users avoid persisting
+# secrets to ~/.spotdl/config.json — useful for Docker and CI runs where
+# values come from the environment.
 _ENV_OVERRIDES = (
     ("SPOTDL_CLIENT_ID", "client_id"),
     ("SPOTDL_CLIENT_SECRET", "client_secret"),
+    ("SPOTDL_GENIUS_TOKEN", "genius_token"),
 )
 
 

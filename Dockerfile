@@ -1,7 +1,5 @@
 FROM python:3-alpine
 
-LABEL maintainer="xnetcat (Jakub)"
-
 # Install dependencies
 RUN apk add --no-cache \
     ca-certificates \

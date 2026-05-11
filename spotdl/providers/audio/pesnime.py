@@ -129,6 +129,11 @@ class PesniMe(AudioProvider):
                     author=artist,
                     result_id=str(item.get("id") or download_url),
                     artists=tuple(a.strip() for a in artist.split(",") if a.strip()),
+                    # pesni.me has no play-count concept and our URLs are direct
+                    # mp3 files, so yt-dlp's view_count probe would KeyError.
+                    # Setting a constant value disables view-based tiebreak in
+                    # AudioProvider.get_best_result.
+                    views=1,
                 )
             )
 
