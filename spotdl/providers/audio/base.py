@@ -393,8 +393,10 @@ class AudioProvider:
             if data:
                 return data
         except Exception as exception:
-            logger.debug(exception)
-            raise AudioProviderError(f"YT-DLP download error - {url}") from exception
+            logger.debug("yt-dlp failure for %s: %s", url, exception)
+            raise AudioProviderError(
+                f"YT-DLP download error - {url}: {exception}"
+            ) from exception
 
         raise AudioProviderError(f"No metadata found for the provided url {url}")
 
