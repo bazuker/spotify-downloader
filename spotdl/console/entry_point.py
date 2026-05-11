@@ -56,10 +56,20 @@ def _apply_env_overrides(arguments: Namespace) -> None:
     win; env vars beat the config file and built-in defaults.
     """
 
+    overrode_creds = False
     for env_var, attr in _ENV_OVERRIDES:
         value = os.environ.get(env_var)
         if value and getattr(arguments, attr, None) is None:
             setattr(arguments, attr, value)
+            if attr in ("client_id", "client_secret"):
+                overrode_creds = True
+
+    # Spotipy's CacheFileHandler keys tokens by file path, not by client_id.
+    # If a previous run cached a token under the shared upstream creds, that
+    # token would otherwise be replayed under our new env creds and we'd stay
+    # rate-limited. Force in-memory caching whenever env vars supplied creds.
+    if overrode_creds and getattr(arguments, "no_cache", None) is None:
+        arguments.no_cache = True
 
 
 def console_entry_point():
