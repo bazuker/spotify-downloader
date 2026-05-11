@@ -199,9 +199,18 @@ def create_m3u_file(
         detect_formats,
     )
 
-    file_path = Path(
-        *(sanitize_string(part) for part in Path(file_name).parts)
-    ).absolute()
+    # Sanitize each path component, but preserve the root anchor.
+    # `sanitize_string` strips '/' which, when applied to the root '/' part,
+    # silently turns an absolute path into a relative one — `Path.absolute()`
+    # would then rebase it on the process cwd (e.g. WORKDIR /music in the
+    # Docker image), producing /music/music/Playlists/<name>.m3u8.
+    src = Path(file_name)
+    parts = src.parts
+    if src.is_absolute() and parts:
+        sanitized = (parts[0],) + tuple(sanitize_string(p) for p in parts[1:])
+    else:
+        sanitized = tuple(sanitize_string(p) for p in parts)
+    file_path = Path(*sanitized).absolute()
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
