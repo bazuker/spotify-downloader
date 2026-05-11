@@ -847,7 +847,7 @@ class Downloader:
                 )
             except Exception as exception:
                 raise MetadataError(
-                    "Failed to embed metadata to the song"
+                    f"Failed to embed metadata: {exception}"
                 ) from exception
 
             if self.settings["generate_lrc"]:

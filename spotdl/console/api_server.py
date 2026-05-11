@@ -37,7 +37,7 @@ from spotdl.types.options import DownloaderOptions, WebOptions
 from spotdl.types.song import Song
 from spotdl.utils.archive import Archive
 from spotdl.utils.formatter import create_file_name
-from spotdl.utils.metadata import embed_metadata
+from spotdl.utils.metadata import embed_metadata, get_file_metadata
 from spotdl.utils.search import get_simple_songs
 
 __all__ = ["api_server"]
@@ -217,9 +217,11 @@ def api_server(
     @app.post("/enrich", response_model=EnrichResponse)
     def enrich(
         file: UploadFile = File(...),
-        url: str = Form(...),
+        url: str = Form(""),
     ) -> EnrichResponse:
-        if _kind_from_url(url) != "track":
+        # Empty `url` means the user /skipped — tag with the file's own ID3
+        # data + filename fallback, no Spotify lookup.
+        if url and _kind_from_url(url) != "track":
             raise HTTPException(
                 status_code=400,
                 detail="URL must be a Spotify track URL",
@@ -235,10 +237,12 @@ def api_server(
         try:
             with os.fdopen(fd, "wb") as out:
                 shutil.copyfileobj(file.file, out)
-            return _enrich_file(tmp_path, url, downloader_settings)
+            if url:
+                return _enrich_file(tmp_path, url, downloader_settings)
+            return _enrich_file_skip(tmp_path, file.filename, downloader_settings)
         finally:
-            # If _enrich_file moved the temp file to its final location this
-            # is a no-op; otherwise we leave nothing behind.
+            # If the enrich path moved the temp file to its final location
+            # this is a no-op; otherwise we leave nothing behind.
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
@@ -427,6 +431,119 @@ def _enrich_file(
         song_name=song.name,
         song_artist=song.artist,
     )
+
+
+def _enrich_file_skip(
+    tmp_path: Path, original_filename: str, base_settings: DownloaderOptions
+) -> EnrichResponse:
+    """
+    /enrich path when the user skipped Spotify association. Builds a Song
+    from the file's existing ID3 tags (read via mutagen), filling missing
+    fields by parsing the original filename for an "Artist - Title" pattern.
+    Falls back to "Unknown" placeholders only when both sources are silent.
+
+    The file's embedded cover art is preserved untouched — we pass
+    `skip_album_art=True` to embed_metadata so it doesn't try to overwrite
+    with a None cover_url.
+    """
+
+    file_meta = get_file_metadata(
+        tmp_path, base_settings.get("id3_separator", "/")
+    ) or {}
+
+    filename_artist, filename_title = _parse_filename(original_filename)
+
+    name = (file_meta.get("name") or filename_title or "Unknown Title").strip() or "Unknown Title"
+    primary_artist = (
+        file_meta.get("artist") or filename_artist or "Unknown Artist"
+    ).strip() or "Unknown Artist"
+
+    artists_raw = file_meta.get("artists")
+    if isinstance(artists_raw, list) and artists_raw:
+        artists = [str(a).strip() for a in artists_raw if str(a).strip()]
+    else:
+        artists = [primary_artist]
+
+    album = (file_meta.get("album_name") or name).strip() or name
+    album_artist = (file_meta.get("album_artist") or primary_artist).strip() or primary_artist
+
+    song = Song.from_missing_data(
+        name=name,
+        artists=artists,
+        artist=primary_artist,
+        genres=list(file_meta.get("genres") or []),
+        disc_number=int(file_meta.get("disc_number") or 1),
+        disc_count=int(file_meta.get("disc_count") or 1),
+        album_name=album,
+        album_artist=album_artist,
+        album_id="",
+        duration=int(file_meta.get("duration") or 0),
+        year=int(file_meta.get("year") or 0),
+        date=str(file_meta.get("date") or ""),
+        track_number=int(file_meta.get("track_number") or 1),
+        tracks_count=int(file_meta.get("tracks_count") or 1),
+        song_id="",
+        explicit=False,
+        publisher=str(file_meta.get("publisher") or ""),
+        url=str(file_meta.get("url") or ""),
+        isrc=file_meta.get("isrc"),
+        cover_url=None,
+        copyright_text=str(file_meta.get("copyright_text") or "") or None,
+        download_url=None,
+        lyrics=file_meta.get("lyrics"),
+    )
+
+    output_file = create_file_name(
+        song,
+        base_settings["output"],
+        base_settings["format"],
+        base_settings.get("restrict"),
+    )
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(tmp_path), str(output_file))
+
+    try:
+        embed_metadata(
+            output_file,
+            song,
+            id3_separator=base_settings.get("id3_separator", "/"),
+            skip_album_art=True,  # preserve the file's existing cover, if any
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=500, detail=f"Failed to embed metadata: {exc}"
+        ) from exc
+
+    logger.info(
+        "enriched (skip) %s → %s",
+        song.display_name,
+        output_file,
+    )
+    return EnrichResponse(
+        url="",
+        output_path=str(output_file),
+        song_name=song.name,
+        song_artist=song.artist,
+    )
+
+
+def _parse_filename(filename: str) -> tuple:
+    """
+    Best-effort parse of a Telegram-supplied filename. Returns
+    (artist, title) where each may be None.
+
+    Recognises the de-facto convention `Artist - Title.mp3`; otherwise treats
+    the whole stem as the title and leaves artist None for the caller to
+    backfill from elsewhere.
+    """
+
+    stem = Path(filename).stem.strip()
+    if not stem:
+        return None, None
+    parts = stem.split(" - ", 1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    return None, stem
 
 
 def _youtube_with_spotify(
