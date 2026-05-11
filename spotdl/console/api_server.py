@@ -32,6 +32,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from spotdl.download.downloader import LYRICS_PROVIDERS, Downloader
+from spotdl.providers.audio.base import AudioProvider
 from spotdl.types.options import DownloaderOptions, WebOptions
 from spotdl.types.song import Song
 from spotdl.utils.archive import Archive
@@ -72,12 +73,24 @@ class SubmitRequest(BaseModel):
 
 
 class EnrichResponse(BaseModel):
-    """Returned by POST /enrich."""
+    """Returned by POST /enrich and POST /youtube."""
 
     url: str
     output_path: str
     song_name: str
     song_artist: str
+
+
+class YouTubeRequest(BaseModel):
+    """Body of POST /youtube.
+
+    `spotify_url` is optional: when provided, audio comes from `youtube_url`
+    but tags come from Spotify (and the Spotify URL is added to the archive).
+    When omitted, tags are built from yt-dlp's own extracted fields.
+    """
+
+    youtube_url: str
+    spotify_url: Optional[str] = None
 
 
 class SubmitResponse(BaseModel):
@@ -231,6 +244,22 @@ def api_server(
                     tmp_path.unlink()
                 except OSError:
                     pass
+
+    @app.post("/youtube", response_model=EnrichResponse)
+    def youtube(req: YouTubeRequest) -> EnrichResponse:
+        if not req.youtube_url:
+            raise HTTPException(status_code=400, detail="youtube_url is required")
+
+        if req.spotify_url:
+            if _kind_from_url(req.spotify_url) != "track":
+                raise HTTPException(
+                    status_code=400,
+                    detail="spotify_url must be a Spotify track URL",
+                )
+            return _youtube_with_spotify(
+                req.youtube_url, req.spotify_url, downloader_settings
+            )
+        return _youtube_skip_spotify(req.youtube_url, downloader_settings)
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def status(job_id: str) -> JobStatus:
@@ -397,6 +426,171 @@ def _enrich_file(
         output_path=str(output_file),
         song_name=song.name,
         song_artist=song.artist,
+    )
+
+
+def _youtube_with_spotify(
+    youtube_url: str, spotify_url: str, base_settings: DownloaderOptions
+) -> EnrichResponse:
+    """
+    Download audio from `youtube_url`, tag with Spotify metadata from
+    `spotify_url`, and add the Spotify URL to the archive.
+    """
+
+    try:
+        song = Song.from_url(spotify_url)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=400, detail=f"Failed to resolve Spotify URL: {exc}"
+        ) from exc
+
+    song.lyrics = _fetch_lyrics(song, base_settings)
+    output_path, song = _run_single_song(song, youtube_url, base_settings)
+    _add_to_archive(spotify_url, base_settings)
+
+    return EnrichResponse(
+        url=spotify_url,
+        output_path=output_path,
+        song_name=song.name,
+        song_artist=song.artist,
+    )
+
+
+def _youtube_skip_spotify(
+    youtube_url: str, base_settings: DownloaderOptions
+) -> EnrichResponse:
+    """
+    Download audio from `youtube_url` and tag it with yt-dlp's extracted
+    fields (track/artist/album/year if it's a YT Music URL, otherwise
+    title/uploader). Cover art = the largest available video thumbnail.
+    """
+
+    provider = AudioProvider(
+        output_format=base_settings["format"],
+        cookie_file=base_settings.get("cookie_file"),
+    )
+    try:
+        info = provider.get_download_metadata(youtube_url, download=False)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=400, detail=f"yt-dlp could not resolve URL: {exc}"
+        ) from exc
+
+    song = _song_from_youtube_info(info, youtube_url)
+    output_path, song = _run_single_song(song, youtube_url, base_settings)
+
+    return EnrichResponse(
+        url=youtube_url,
+        output_path=output_path,
+        song_name=song.name,
+        song_artist=song.artist,
+    )
+
+
+def _run_single_song(
+    song: Song, youtube_url: str, base_settings: DownloaderOptions
+) -> tuple:
+    """
+    Hand a pre-built Song to the regular Downloader, with `download_url` set
+    to the YouTube URL so spotdl skips the search step and goes straight to
+    yt-dlp. Returns (output_path, song). Raises HTTPException on failure.
+
+    scan_for_songs / archive are disabled in the per-request settings: we
+    only want one file processed, and the archive update (if any) is done by
+    the caller after this returns successfully.
+    """
+
+    song.download_url = youtube_url
+
+    per_request: Dict[str, Any] = dict(base_settings)
+    per_request["scan_for_songs"] = False
+    per_request["archive"] = None
+
+    downloader = Downloader(per_request)
+    try:
+        results = downloader.download_multiple_songs([song])
+    finally:
+        try:
+            downloader.progress_handler.close()
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    if not results or results[0][1] is None:
+        detail = downloader.errors[0] if downloader.errors else "Download failed"
+        raise HTTPException(status_code=500, detail=detail)
+
+    return str(results[0][1]), results[0][0]
+
+
+def _song_from_youtube_info(info: Dict[str, Any], youtube_url: str) -> Song:
+    """
+    Build a minimal Song from yt-dlp's info_dict. Fills every field
+    downstream code might dereference (notably the ones search_and_download
+    checks at downloader.py:472-479 — None for any of them would trigger a
+    reinit_song call that hits Spotify, which we explicitly don't want here).
+    """
+
+    track = (info.get("track") or info.get("title") or "Unknown Title").strip()
+
+    artists_raw = info.get("artists")
+    if isinstance(artists_raw, list) and artists_raw:
+        artists = [str(a).strip() for a in artists_raw if str(a).strip()]
+    else:
+        artist_str = (
+            info.get("artist") or info.get("uploader") or "Unknown Artist"
+        )
+        artists = [a.strip() for a in str(artist_str).split(",") if a.strip()]
+    if not artists:
+        artists = ["Unknown Artist"]
+
+    album = (info.get("album") or track).strip()
+    album_artist = str(info.get("album_artist") or artists[0]).strip()
+
+    cover_url: Optional[str] = info.get("thumbnail")
+    thumbs = info.get("thumbnails") or []
+    if thumbs:
+        best = max(
+            (t for t in thumbs if isinstance(t, dict)),
+            key=lambda t: (t.get("width") or 0) * (t.get("height") or 0),
+            default=None,
+        )
+        if best and best.get("url"):
+            cover_url = best["url"]
+
+    year = 0
+    if info.get("release_year"):
+        try:
+            year = int(info["release_year"])
+        except (TypeError, ValueError):
+            year = 0
+    elif info.get("upload_date"):
+        ud = str(info["upload_date"])
+        if len(ud) >= 4 and ud[:4].isdigit():
+            year = int(ud[:4])
+
+    return Song.from_missing_data(
+        name=track,
+        artists=artists,
+        artist=artists[0],
+        genres=[],
+        disc_number=1,
+        disc_count=1,
+        album_name=album,
+        album_artist=album_artist,
+        album_id="",
+        duration=int(info.get("duration") or 0),
+        year=year,
+        date=str(info.get("upload_date") or ""),
+        track_number=1,
+        tracks_count=1,
+        song_id=str(info.get("id") or youtube_url),
+        explicit=False,
+        publisher="",
+        url=youtube_url,
+        isrc=None,
+        cover_url=cover_url,
+        copyright_text=None,
+        download_url=youtube_url,
     )
 
 
