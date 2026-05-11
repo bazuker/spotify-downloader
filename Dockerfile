@@ -1,4 +1,8 @@
-FROM python:3-alpine
+# Pinned to 3.13 because `python:3-alpine` floats to the newest 3.x (3.14 at
+# time of writing) and several wheels (notably rapidfuzz 3.12.x) aren't
+# published for 3.14 yet, forcing a from-source build that fails on strict
+# scikit-build-core pyproject parsing. 3.13 has full wheel coverage.
+FROM python:3.13-alpine
 
 # Install dependencies
 RUN apk add --no-cache \
