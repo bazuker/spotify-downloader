@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from spotdl.download.downloader import LYRICS_PROVIDERS, Downloader
 from spotdl.types.options import DownloaderOptions, WebOptions
 from spotdl.types.song import Song
+from spotdl.utils.archive import Archive
 from spotdl.utils.formatter import create_file_name
 from spotdl.utils.metadata import embed_metadata
 from spotdl.utils.search import get_simple_songs
@@ -44,6 +45,11 @@ logger = logging.getLogger(__name__)
 
 _KNOWN_KINDS = {"track", "album", "playlist", "artist"}
 _ARCHIVE_FILENAME = "musicdon.archive"
+
+# Serializes archive read-modify-write across endpoints. The Downloader holds
+# its own copy of the archive in memory during a /download run and saves at
+# the end; an /enrich finishing mid-download would otherwise race that save.
+_archive_lock = threading.Lock()
 
 # How long terminal (done/failed) jobs stay readable after they finish. Long
 # enough that the bot's poll loop can pick up the final state and include it
@@ -375,6 +381,12 @@ def _enrich_file(
             status_code=500, detail=f"Failed to embed metadata: {exc}"
         ) from exc
 
+    # We just produced an audio file for this Spotify URL, so it belongs in
+    # the archive — future playlist downloads containing this track will
+    # skip the download leg. Failure here doesn't roll back the enrich; the
+    # tagged file is already valuable on its own.
+    _add_to_archive(song.url, base_settings)
+
     logger.info(
         "enriched %s → %s",
         song.display_name,
@@ -386,6 +398,30 @@ def _enrich_file(
         song_name=song.name,
         song_artist=song.artist,
     )
+
+
+def _add_to_archive(url: str, settings: DownloaderOptions) -> None:
+    """
+    Append a URL to the configured archive file. Re-reads the file under a
+    process-wide lock so a concurrent download's save() can't drop our
+    addition (and ours can't drop theirs).
+    """
+
+    archive_path = settings.get("archive")
+    if not archive_path:
+        return
+
+    with _archive_lock:
+        archive = Archive()
+        archive.load(archive_path)  # silently no-op when file is absent
+        if url in archive:
+            return
+        archive.add(url)
+        try:
+            archive.save(archive_path)
+            logger.info("archive: added %s", url)
+        except OSError as exc:
+            logger.warning("archive: failed to save %s: %s", archive_path, exc)
 
 
 def _fetch_lyrics(song: Song, settings: DownloaderOptions) -> Optional[str]:
