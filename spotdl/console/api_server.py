@@ -401,6 +401,12 @@ def _enrich_file(
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     shutil.move(str(tmp_path), str(output_file))
+    # tempfile.mkstemp creates files mode 0600 for security, and shutil.move
+    # across filesystems (which /tmp → /music is, inside the container)
+    # preserves those bits. Without this chmod the library file would be
+    # owner-only and Navidrome — running as a non-root user — couldn't read
+    # it, silently skipping the file during scans.
+    os.chmod(output_file, 0o644)
 
     try:
         embed_metadata(
@@ -501,6 +507,12 @@ def _enrich_file_skip(
     )
     output_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(tmp_path), str(output_file))
+    # tempfile.mkstemp creates files mode 0600 for security, and shutil.move
+    # across filesystems (which /tmp → /music is, inside the container)
+    # preserves those bits. Without this chmod the library file would be
+    # owner-only and Navidrome — running as a non-root user — couldn't read
+    # it, silently skipping the file during scans.
+    os.chmod(output_file, 0o644)
 
     try:
         embed_metadata(
