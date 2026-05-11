@@ -46,6 +46,7 @@ _ENV_OVERRIDES = (
     ("SPOTDL_CLIENT_ID", "client_id"),
     ("SPOTDL_CLIENT_SECRET", "client_secret"),
     ("SPOTDL_GENIUS_TOKEN", "genius_token"),
+    ("SPOTDL_COOKIE_FILE", "cookie_file"),
 )
 
 
@@ -60,6 +61,11 @@ def _apply_env_overrides(arguments: Namespace) -> None:
     for env_var, attr in _ENV_OVERRIDES:
         value = os.environ.get(env_var)
         if value and getattr(arguments, attr, None) is None:
+            # cookie_file is special: yt-dlp errors on a missing path. Skip
+            # silently when the file isn't there yet so the server still
+            # starts cleanly for users who haven't dropped in cookies.txt.
+            if attr == "cookie_file" and not os.path.isfile(value):
+                continue
             setattr(arguments, attr, value)
             if attr in ("client_id", "client_secret"):
                 overrode_creds = True
