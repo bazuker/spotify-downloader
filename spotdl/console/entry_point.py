@@ -4,10 +4,12 @@ Module that holds the entry point for the console.
 
 import cProfile
 import logging
+import os
 import pstats
 import signal
 import sys
 import time
+from argparse import Namespace
 
 from spotdl.console.download import download
 from spotdl.console.meta import meta
@@ -35,6 +37,27 @@ OPERATIONS = {
 }
 
 logger = logging.getLogger(__name__)
+
+# Environment-variable overrides for Spotify credentials. The pair lets users
+# avoid persisting credentials to ~/.spotdl/config.json — useful for Docker
+# and CI runs where secrets come from the environment.
+_ENV_OVERRIDES = (
+    ("SPOTDL_CLIENT_ID", "client_id"),
+    ("SPOTDL_CLIENT_SECRET", "client_secret"),
+)
+
+
+def _apply_env_overrides(arguments: Namespace) -> None:
+    """
+    Copy SPOTDL_* environment values onto the parsed argument namespace, but
+    only for flags the user did not pass on the command line. CLI flags still
+    win; env vars beat the config file and built-in defaults.
+    """
+
+    for env_var, attr in _ENV_OVERRIDES:
+        value = os.environ.get(env_var)
+        if value and getattr(arguments, attr, None) is None:
+            setattr(arguments, attr, value)
 
 
 def console_entry_point():
@@ -76,6 +99,7 @@ def entry_point():
 
     # Parse the arguments
     arguments = parse_arguments()
+    _apply_env_overrides(arguments)
 
     # Create settings dicts
     spotify_settings, downloader_settings, web_settings = create_settings(arguments)

@@ -128,7 +128,6 @@ class PesniMe(AudioProvider):
                     duration=float(item.get("duration") or 0),
                     author=artist,
                     result_id=str(item.get("id") or download_url),
-                    search_query=search_term,
                     artists=tuple(a.strip() for a in artist.split(",") if a.strip()),
                 )
             )
