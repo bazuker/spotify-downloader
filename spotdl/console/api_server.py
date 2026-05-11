@@ -78,6 +78,7 @@ class JobStatus(BaseModel):
     errored: int = 0
     skipped: int = 0
     paths: List[str] = []
+    errored_tracks: List[str] = []
     error: Optional[str] = None
 
 
@@ -94,6 +95,7 @@ class Job:
     errored: int = 0
     skipped: int = 0  # already-archived tracks; not counted against `total`
     paths: List[str] = field(default_factory=list)
+    errored_tracks: List[str] = field(default_factory=list)
     error: Optional[str] = None
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
@@ -194,6 +196,7 @@ def api_server(
                 errored=job.errored,
                 skipped=job.skipped,
                 paths=list(job.paths),
+                errored_tracks=list(job.errored_tracks),
                 error=job.error,
             )
 
@@ -259,6 +262,7 @@ def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
                     job.downloaded += 1
                 else:
                     job.errored += 1
+                    job.errored_tracks.append(song.display_name)
             return result
 
         downloader.search_and_download = tracked_search_and_download  # type: ignore[assignment]
