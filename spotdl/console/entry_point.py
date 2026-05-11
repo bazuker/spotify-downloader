@@ -64,8 +64,24 @@ def _apply_env_overrides(arguments: Namespace) -> None:
             # cookie_file is special: yt-dlp errors on a missing path. Skip
             # silently when the file isn't there yet so the server still
             # starts cleanly for users who haven't dropped in cookies.txt.
-            if attr == "cookie_file" and not os.path.isfile(value):
-                continue
+            if attr == "cookie_file":
+                # Print direct to stderr — this runs before init_logging() so
+                # logger.info()/warning() may be swallowed by Python's default
+                # log config, which would silently hide the cookie status.
+                if not os.path.isfile(value):
+                    print(
+                        f"[spotdl] WARN: {env_var}={value} but the file does "
+                        f"not exist; yt-dlp will run without cookies",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                print(
+                    f"[spotdl] yt-dlp cookies loaded from {value} "
+                    f"({os.path.getsize(value)} bytes)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             setattr(arguments, attr, value)
             if attr in ("client_id", "client_secret"):
                 overrode_creds = True

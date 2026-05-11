@@ -4,7 +4,12 @@
 # scikit-build-core pyproject parsing. 3.13 has full wheel coverage.
 FROM python:3.13-alpine
 
-# Install dependencies
+# Install dependencies. `deno` is required by yt-dlp to evaluate YouTube's
+# player JavaScript (signature/n-challenge decryption). yt-dlp's EJS
+# subsystem auto-detects deno only — node works but needs explicit
+# `--js-runtimes` config, which spotdl doesn't expose cleanly. Without a JS
+# runtime, yt-dlp returns storyboard-only formats for modern YouTube videos
+# and downloads fail with "Requested format is not available".
 RUN apk add --no-cache \
     ca-certificates \
     ffmpeg \
@@ -12,6 +17,7 @@ RUN apk add --no-cache \
     aria2 \
     g++ \
     git \
+    deno \
     py3-cffi \
     libffi-dev \
     zlib-dev

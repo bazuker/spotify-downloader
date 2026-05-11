@@ -634,6 +634,11 @@ def _run_single_song(
     per_request: Dict[str, Any] = dict(base_settings)
     per_request["scan_for_songs"] = False
     per_request["archive"] = None
+    # Single-track flows (YouTube, enrich) have no playlist context. Clearing
+    # m3u here suppresses the "M3U file name contains '{list}' but no lists
+    # were provided" warning that fires when gen_m3u_files is invoked
+    # without any songs carrying a list_name.
+    per_request["m3u"] = None
 
     downloader = Downloader(per_request)
     try:
