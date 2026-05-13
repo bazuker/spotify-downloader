@@ -121,6 +121,29 @@ class YouTubeRequest(BaseModel):
     spotify_url: Optional[str] = None
 
 
+class LookupRequest(BaseModel):
+    """Body of POST /lookup."""
+
+    urls: List[str]
+
+
+class LookupResult(BaseModel):
+    """One resolved Spotify track. `error` is set when the lookup failed and
+    the other fields are empty."""
+
+    url: str
+    name: Optional[str] = None
+    artist: Optional[str] = None
+    artists: List[str] = []
+    error: Optional[str] = None
+
+
+class LookupResponse(BaseModel):
+    """Returned by POST /lookup."""
+
+    results: List[LookupResult]
+
+
 class SubmitResponse(BaseModel):
     """Returned by POST /download — the bot polls /jobs/{job_id} from here on."""
 
@@ -302,6 +325,28 @@ def api_server(
                 detail=f"unsupported URL kind for /delete: {kind!r}",
             )
         return _run_delete(req.url, kind, req.confirm, downloader_settings)
+
+    @app.post("/lookup", response_model=LookupResponse)
+    def lookup(req: LookupRequest) -> LookupResponse:
+        results: List[LookupResult] = []
+        for url in req.urls:
+            if _kind_from_url(url) != "track":
+                results.append(LookupResult(url=url, error="not a track URL"))
+                continue
+            try:
+                song = Song.from_url(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                results.append(LookupResult(url=url, error=str(exc)))
+                continue
+            results.append(
+                LookupResult(
+                    url=url,
+                    name=song.name,
+                    artist=song.artist,
+                    artists=list(song.artists),
+                )
+            )
+        return LookupResponse(results=results)
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def status(job_id: str) -> JobStatus:
