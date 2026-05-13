@@ -81,6 +81,34 @@ class EnrichResponse(BaseModel):
     song_artist: str
 
 
+class DeleteRequest(BaseModel):
+    """Body of POST /delete."""
+
+    url: str
+    confirm: bool = False
+
+
+class DeleteTarget(BaseModel):
+    """One audio file scheduled for deletion (or just deleted)."""
+
+    url: str
+    path: str
+    name: str
+
+
+class DeleteResponse(BaseModel):
+    """Returned by POST /delete."""
+
+    kind: str
+    targets: List[DeleteTarget]
+    m3u_path: Optional[str] = None
+    count: int
+    confirmed: bool
+    deleted_count: int = 0
+    m3u_entries_stripped: int = 0
+    errors: List[str] = []
+
+
 class YouTubeRequest(BaseModel):
     """Body of POST /youtube.
 
@@ -264,6 +292,16 @@ def api_server(
                 req.youtube_url, req.spotify_url, downloader_settings
             )
         return _youtube_skip_spotify(req.youtube_url, downloader_settings)
+
+    @app.post("/delete", response_model=DeleteResponse)
+    def delete(req: DeleteRequest) -> DeleteResponse:
+        kind = _kind_from_url(req.url)
+        if kind not in {"track", "album", "playlist"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported URL kind for /delete: {kind!r}",
+            )
+        return _run_delete(req.url, kind, req.confirm, downloader_settings)
 
     @app.get("/jobs/{job_id}", response_model=JobStatus)
     def status(job_id: str) -> JobStatus:
@@ -726,6 +764,247 @@ def _song_from_youtube_info(info: Dict[str, Any], youtube_url: str) -> Song:
         copyright_text=None,
         download_url=youtube_url,
     )
+
+
+def _run_delete(
+    url: str, kind: str, confirm: bool, settings: DownloaderOptions
+) -> DeleteResponse:
+    """
+    Resolve the deletion scope, look up matching audio files via the WOAS
+    ID3 tag, and (when confirm=True) actually remove them, strip their
+    references from every m3u, and remove the playlist's own m3u for
+    playlist-kind URLs. Archive entries for deleted files are removed too.
+    """
+
+    try:
+        target_urls = _resolve_delete_scope(url, kind)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(
+            status_code=400, detail=f"failed to resolve {url}: {exc}"
+        ) from exc
+
+    targets = _find_files_for_urls(target_urls, settings)
+    m3u_path = (
+        _m3u_path_for_playlist(url, settings) if kind == "playlist" else None
+    )
+
+    if not confirm:
+        return DeleteResponse(
+            kind=kind,
+            targets=targets,
+            m3u_path=m3u_path,
+            count=len(targets),
+            confirmed=False,
+        )
+
+    deleted_count = 0
+    deleted_paths: List[str] = []
+    deleted_urls: List[str] = []
+    errors: List[str] = []
+    for t in targets:
+        try:
+            Path(t.path).unlink()
+            deleted_count += 1
+            deleted_paths.append(t.path)
+            deleted_urls.append(t.url)
+        except FileNotFoundError:
+            # File already gone — still treat as success and clean archive.
+            deleted_urls.append(t.url)
+        except OSError as exc:
+            errors.append(f"unlink {t.path}: {exc}")
+
+    if deleted_urls:
+        _archive_remove_many(deleted_urls, settings)
+
+    stripped = _strip_m3u_references(
+        deleted_paths, settings, except_m3u=m3u_path
+    )
+
+    if m3u_path and Path(m3u_path).exists():
+        try:
+            Path(m3u_path).unlink()
+        except OSError as exc:
+            errors.append(f"unlink m3u {m3u_path}: {exc}")
+
+    logger.info(
+        "delete: kind=%s url=%s files=%d m3u_stripped=%d m3u_removed=%s",
+        kind,
+        url,
+        deleted_count,
+        stripped,
+        bool(m3u_path),
+    )
+    return DeleteResponse(
+        kind=kind,
+        targets=targets,
+        m3u_path=m3u_path,
+        count=len(targets),
+        confirmed=True,
+        deleted_count=deleted_count,
+        m3u_entries_stripped=stripped,
+        errors=errors,
+    )
+
+
+def _resolve_delete_scope(url: str, kind: str) -> List[str]:
+    """Spotify track URLs in scope of the deletion. Hits Spotify API for
+    album/playlist kinds to get the current member list."""
+
+    if kind == "track":
+        return [url]
+
+    # Lazy import — only the album/playlist paths need the client.
+    from spotdl.utils.spotify import SpotifyClient  # noqa: PLC0415
+
+    client = SpotifyClient()
+    urls: List[str] = []
+    if kind == "playlist":
+        page = client.playlist_items(url, additional_types=("track",))
+        while page:
+            for item in page.get("items") or []:
+                track = item.get("track") if isinstance(item, dict) else None
+                if track and track.get("external_urls", {}).get("spotify"):
+                    urls.append(track["external_urls"]["spotify"])
+            page = client.next(page) if page.get("next") else None
+    elif kind == "album":
+        page = client.album_tracks(url)
+        while page:
+            for track in page.get("items") or []:
+                if track.get("external_urls", {}).get("spotify"):
+                    urls.append(track["external_urls"]["spotify"])
+            page = client.next(page) if page.get("next") else None
+    return urls
+
+
+def _find_files_for_urls(
+    urls: List[str], settings: DownloaderOptions
+) -> List[DeleteTarget]:
+    """Walk the output tree once and pick files whose WOAS tag matches one
+    of `urls`. Survives template/filename changes since the original
+    download because the index key is the Spotify URL, not the file path."""
+
+    if not urls:
+        return []
+
+    # Lazy import to avoid pulling search at module load time.
+    from spotdl.utils.search import gather_known_songs  # noqa: PLC0415
+
+    formats = settings.get("detect_formats") or [settings["format"]]
+    index: Dict[str, List[Path]] = {}
+    for fmt in formats:
+        for u, paths in gather_known_songs(settings["output"], fmt).items():
+            index.setdefault(u, []).extend(paths)
+
+    wanted = set(urls)
+    targets: List[DeleteTarget] = []
+    for u, paths in index.items():
+        if u not in wanted:
+            continue
+        for path in paths:
+            targets.append(
+                DeleteTarget(url=u, path=str(path), name=path.stem)
+            )
+    return targets
+
+
+def _m3u_path_for_playlist(
+    playlist_url: str, settings: DownloaderOptions
+) -> Optional[str]:
+    """Reconstruct the m3u path we would have written for this playlist by
+    looking up its current name from Spotify and applying the same
+    sanitization spotdl uses at write time."""
+
+    from spotdl.utils.formatter import sanitize_string  # noqa: PLC0415
+    from spotdl.utils.spotify import SpotifyClient  # noqa: PLC0415
+
+    try:
+        pl = SpotifyClient().playlist(playlist_url)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not pl or not pl.get("name"):
+        return None
+
+    base = settings["output"].split("{", 1)[0].rstrip("/") or "."
+    sanitized_name = sanitize_string(pl["name"])
+    if not sanitized_name:
+        return None
+    return str(Path(base).expanduser() / "Playlists" / f"{sanitized_name}.m3u8")
+
+
+def _archive_remove_many(urls: List[str], settings: DownloaderOptions) -> int:
+    """Drop the given URLs from the archive. Returns the count removed."""
+
+    archive_path = settings.get("archive")
+    if not archive_path or not urls:
+        return 0
+    with _archive_lock:
+        archive = Archive()
+        archive.load(archive_path)
+        before = len(archive)
+        for url in urls:
+            archive.discard(url)
+        removed = before - len(archive)
+        if removed:
+            try:
+                archive.save(archive_path)
+                logger.info("archive: removed %d url(s)", removed)
+            except OSError as exc:
+                logger.warning(
+                    "archive: failed to rewrite %s: %s", archive_path, exc
+                )
+        return removed
+
+
+def _strip_m3u_references(
+    deleted_paths: List[str],
+    settings: DownloaderOptions,
+    except_m3u: Optional[str] = None,
+) -> int:
+    """
+    Walk every m3u under `<music-root>/Playlists/` and remove lines that
+    point at one of the just-deleted audio files. Also removes the
+    immediately preceding `#EXTINF:` line for each removed entry so the m3u
+    pairing stays consistent. Returns the total number of entries stripped.
+
+    `except_m3u`: if set, this m3u is skipped — used when the caller is
+    about to delete the file entirely (playlist-kind delete).
+    """
+
+    base = settings["output"].split("{", 1)[0].rstrip("/") or "."
+    playlists_dir = Path(base).expanduser() / "Playlists"
+    if not playlists_dir.exists():
+        return 0
+
+    paths_set = set(deleted_paths)
+    total_stripped = 0
+
+    for m3u in playlists_dir.glob("*.m3u8"):
+        if except_m3u and str(m3u) == except_m3u:
+            continue
+        try:
+            lines = m3u.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+
+        new_lines: List[str] = []
+        stripped_here = 0
+        for line in lines:
+            if line.strip() in paths_set:
+                # Drop the immediately preceding #EXTINF: line if present.
+                if new_lines and new_lines[-1].startswith("#EXTINF:"):
+                    new_lines.pop()
+                stripped_here += 1
+                continue
+            new_lines.append(line)
+
+        if stripped_here:
+            try:
+                m3u.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+                total_stripped += stripped_here
+            except OSError as exc:
+                logger.warning("failed to rewrite m3u %s: %s", m3u, exc)
+
+    return total_stripped
 
 
 def _add_to_archive(url: str, settings: DownloaderOptions) -> None:
