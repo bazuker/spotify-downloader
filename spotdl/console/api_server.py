@@ -846,6 +846,13 @@ def _enrich_file(
     )
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Remove any pre-existing files in the library carrying this Spotify URL
+    # (other than output_file itself, which shutil.move will overwrite). This
+    # makes "drop a song with the same Spotify URL" replace cleanly even when
+    # the new computed filename differs from the existing one — e.g. the
+    # previous file was /skip'd and tagged under a different artist/title.
+    _cleanup_duplicates_for_url(song.url, output_file, base_settings)
+
     shutil.move(str(tmp_path), str(output_file))
     # tempfile.mkstemp creates files mode 0600 for security, and shutil.move
     # across filesystems (which /tmp → /music is, inside the container)
@@ -1020,6 +1027,20 @@ def _youtube_with_spotify(
         ) from exc
 
     song.lyrics = _fetch_lyrics(song, base_settings)
+
+    # Compute the path _run_single_song will write to, then sweep any other
+    # files in the library already tagged with this Spotify URL. The
+    # `overwrite: force` in _run_single_song already replaces a file sitting
+    # at the canonical path; this catches the case where the previous copy
+    # lived under a different name (e.g. /skip'd upload renamed via tags).
+    canonical = create_file_name(
+        song,
+        base_settings["output"],
+        base_settings["format"],
+        base_settings.get("restrict"),
+    )
+    _cleanup_duplicates_for_url(spotify_url, canonical, base_settings)
+
     output_path, song = _run_single_song(song, youtube_url, base_settings)
     _add_to_archive(spotify_url, base_settings)
 
@@ -1085,6 +1106,12 @@ def _run_single_song(
     # were provided" warning that fires when gen_m3u_files is invoked
     # without any songs carrying a list_name.
     per_request["m3u"] = None
+    # The user explicitly asked for this one song — if a file already exists
+    # at the target path (replace-list claim flow, re-pair after /skip,
+    # etc.) replace it instead of silently skipping. spotdl's default
+    # "skip" makes the bot report success while the file on disk never
+    # changes.
+    per_request["overwrite"] = "force"
 
     downloader = Downloader(per_request)
     try:
@@ -1252,6 +1279,55 @@ def _run_delete(
         m3u_entries_stripped=stripped,
         errors=errors,
     )
+
+
+def _cleanup_duplicates_for_url(
+    spotify_url: str,
+    keep_path: Optional[Path],
+    settings: DownloaderOptions,
+) -> int:
+    """
+    Delete any audio files in the library whose WOAS tag matches
+    `spotify_url`, except for `keep_path` (which the caller is about to
+    write to). Also strips those files' references from every m3u so
+    playlists stay consistent. Returns the number of files removed.
+
+    Called from /enrich and /youtube-with-spotify so that re-tagging or
+    re-downloading a track that already has a copy somewhere in the
+    library (under any path, not just the canonical one) actually
+    replaces it — without this, a /skip'd upload tagged via /associate
+    can leave the original duplicate sitting next to the new file.
+    """
+
+    targets = _find_files_for_urls([spotify_url], settings)
+    if not targets:
+        return 0
+
+    keep_resolved = keep_path.resolve() if keep_path is not None else None
+    deleted_paths: List[str] = []
+    for t in targets:
+        path = Path(t.path)
+        try:
+            if keep_resolved is not None and path.resolve() == keep_resolved:
+                continue
+        except OSError:
+            pass
+        try:
+            path.unlink()
+            deleted_paths.append(t.path)
+        except FileNotFoundError:
+            deleted_paths.append(t.path)
+        except OSError as exc:
+            logger.warning("could not remove duplicate %s: %s", path, exc)
+
+    if deleted_paths:
+        _strip_m3u_references(deleted_paths, settings)
+        logger.info(
+            "cleanup: removed %d duplicate file(s) for %s",
+            len(deleted_paths),
+            spotify_url,
+        )
+    return len(deleted_paths)
 
 
 def _run_delete_navidrome(
