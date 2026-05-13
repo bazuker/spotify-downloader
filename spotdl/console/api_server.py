@@ -145,20 +145,26 @@ def _navidrome_share_id_from_url(url: str) -> Optional[str]:
 
 def _navidrome_share_entries(cfg: NavidromeConfig, share_id: str) -> List[Dict[str, Any]]:
     """
-    Resolve a share to its list of entries via getShare.view. The Subsonic
-    JSON quirk where single-element lists collapse to a dict is normalized
-    here so callers always get a List[Dict].
+    Resolve a share to its list of entries. The Subsonic API exposes only
+    `getShares.view` (plural, all shares accessible to the authenticated
+    user); we fetch the full list and filter by id client-side. The JSON
+    quirk where single-element lists collapse to a dict is normalized here
+    so callers always get a List[Dict].
     """
 
-    body = _subsonic_get(cfg, "getShare.view", {"id": share_id})
+    body = _subsonic_get(cfg, "getShares.view", {})
     shares = (body.get("shares") or {}).get("share")
-    if not shares:
+    if shares is None:
         raise ValueError(f"share not found: {share_id}")
     if isinstance(shares, dict):
         shares = [shares]
-    if not shares:
+    match = next(
+        (s for s in shares if isinstance(s, dict) and s.get("id") == share_id),
+        None,
+    )
+    if match is None:
         raise ValueError(f"share not found: {share_id}")
-    entries = shares[0].get("entry")
+    entries = match.get("entry")
     if entries is None:
         return []
     if isinstance(entries, dict):
@@ -170,16 +176,57 @@ def _local_path_for_subsonic(
     subsonic_path: str, settings: DownloaderOptions
 ) -> Path:
     """
-    Map a Subsonic `path` field (relative to Navidrome's library root) to a
-    filesystem path inside this container. Absolute paths are passed through
-    on the assumption Navidrome and api-server see the same root.
+    Map a Subsonic `path` field to a filesystem path inside this container.
+    Navidrome's container may have a different library mount than ours
+    (Navidrome's `/music` could map to the same host dir as spotdl's
+    `/music`, but the returned path could be absolute or relative, and the
+    leading prefix may not match). We try several candidates and return the
+    first that exists on disk; if none exist, the first candidate is
+    returned so the caller can include it in the error.
     """
 
-    p = Path(subsonic_path)
-    if p.is_absolute():
-        return p
+    for candidate in _local_path_candidates(subsonic_path, settings):
+        if candidate.exists():
+            return candidate
+    # Nothing exists — return our best guess so the caller's error message
+    # surfaces a real path.
+    return next(iter(_local_path_candidates(subsonic_path, settings)))
+
+
+def _local_path_candidates(
+    subsonic_path: str, settings: DownloaderOptions
+) -> List[Path]:
+    """
+    Candidate filesystem paths to try for a Subsonic-reported file. Order:
+      1. path as-is (handles absolute paths that already match our view)
+      2. library-root / path (handles relative paths)
+      3. library-root / (path stripped of its leading anchor) — handles
+         absolute paths that came from a container with a different prefix
+      4. library-root / basename(path) — flat-layout fallback
+    """
+
     base = settings["output"].split("{", 1)[0].rstrip("/") or "."
-    return Path(base).expanduser() / subsonic_path
+    base_path = Path(base).expanduser()
+    sub = Path(subsonic_path)
+
+    candidates: List[Path] = []
+    if sub.is_absolute():
+        candidates.append(sub)
+        anchorless = sub.relative_to(sub.anchor)
+        candidates.append(base_path / anchorless)
+    else:
+        candidates.append(base_path / sub)
+    candidates.append(base_path / sub.name)
+
+    seen: set = set()
+    deduped: List[Path] = []
+    for c in candidates:
+        s = str(c)
+        if s in seen:
+            continue
+        seen.add(s)
+        deduped.append(c)
+    return deduped
 
 
 def _read_woas(file_path: Path) -> Optional[str]:
@@ -242,7 +289,7 @@ def _resolve_navidrome_share(
         sub_path = entry.get("path") or ""
         if not sub_path:
             continue
-        local = _local_path_for_subsonic(sub_path, settings)
+        local = _resolve_navidrome_entry_path(entry, sub_path, settings)
         tracks.append(
             NavidromeTrack(
                 path=str(local),
@@ -252,6 +299,112 @@ def _resolve_navidrome_share(
             )
         )
     return tracks
+
+
+def _resolve_navidrome_entry_path(
+    entry: Dict[str, Any],
+    sub_path: str,
+    settings: DownloaderOptions,
+) -> Path:
+    """
+    Find the on-disk path for a Subsonic entry. We try:
+      1. Candidates derived from Navidrome's reported `path`.
+      2. The canonical path spotdl would have written given the entry's
+         metadata — this handles the common case where Navidrome
+         synthesizes a metadata-shaped path (Artist/Album/Disc-Track -
+         Title) that doesn't match spotdl's flat output template.
+
+    Returns the first path that exists, or our best guess if nothing does.
+    """
+
+    candidates = _local_path_candidates(sub_path, settings)
+    for c in candidates:
+        if c.exists():
+            return c
+
+    canonical = _spotdl_canonical_path_for_entry(entry, settings)
+    if canonical is not None and canonical.exists():
+        return canonical
+
+    # Surface the best guess so the error message points at something useful.
+    if canonical is not None:
+        return canonical
+    return candidates[0]
+
+
+def _spotdl_canonical_path_for_entry(
+    entry: Dict[str, Any], settings: DownloaderOptions
+) -> Optional[Path]:
+    """
+    Build the filesystem path spotdl would have written for this song,
+    using the entry's `title` / `artist` / `albumArtist` / `album` /
+    `track` / `discNumber` / `year` fields. Returns None if there isn't
+    enough metadata to synthesize a sensible Song.
+    """
+
+    title = str(entry.get("title") or "").strip()
+    if not title:
+        return None
+    artist = str(entry.get("artist") or "").strip()
+    album_artist = str(
+        entry.get("albumArtist") or entry.get("artist") or ""
+    ).strip()
+    if not (artist or album_artist):
+        return None
+    artist = artist or album_artist
+    album_artist = album_artist or artist
+    album = str(entry.get("album") or title).strip() or title
+
+    try:
+        track_number = int(entry.get("track") or 1)
+    except (TypeError, ValueError):
+        track_number = 1
+    try:
+        disc_number = int(entry.get("discNumber") or 1)
+    except (TypeError, ValueError):
+        disc_number = 1
+    try:
+        year = int(entry.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    try:
+        duration = int(entry.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
+    try:
+        song = Song.from_missing_data(
+            name=title,
+            artists=[artist],
+            artist=artist,
+            genres=[],
+            disc_number=disc_number,
+            disc_count=1,
+            album_name=album,
+            album_artist=album_artist,
+            album_id="",
+            duration=duration,
+            year=year,
+            date="",
+            track_number=track_number,
+            tracks_count=1,
+            song_id="",
+            explicit=False,
+            publisher="",
+            url="",
+            isrc=None,
+            cover_url=None,
+            copyright_text=None,
+            download_url=None,
+        )
+        return create_file_name(
+            song,
+            settings["output"],
+            settings["format"],
+            settings.get("restrict"),
+        )
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 class SubmitRequest(BaseModel):
@@ -1376,15 +1529,20 @@ def _run_delete_navidrome(
     deleted_urls: List[str] = []
     errors: List[str] = []
     for t in targets:
+        path = Path(t.path)
+        logger.info("delete (navidrome): attempting unlink %s", path)
         try:
-            Path(t.path).unlink()
+            path.unlink()
             deleted_count += 1
             deleted_paths.append(t.path)
             if t.url:
                 deleted_urls.append(t.url)
         except FileNotFoundError:
-            if t.url:
-                deleted_urls.append(t.url)
+            # Unlike the Spotify-URL /delete path (where targets came from a
+            # WOAS scan of files that definitely exist), Navidrome's reported
+            # `path` may not match our filesystem view. Surface that instead
+            # of silently swallowing so the user sees what we tried.
+            errors.append(f"not found: {t.path}")
         except OSError as exc:
             errors.append(f"unlink {t.path}: {exc}")
 
@@ -1394,10 +1552,11 @@ def _run_delete_navidrome(
     stripped = _strip_m3u_references(deleted_paths, settings)
 
     logger.info(
-        "delete (navidrome): share=%s files=%d m3u_stripped=%d",
+        "delete (navidrome): share=%s files=%d m3u_stripped=%d errors=%d",
         share_id,
         deleted_count,
         stripped,
+        len(errors),
     )
     return DeleteResponse(
         kind="navidrome",
