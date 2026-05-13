@@ -15,8 +15,11 @@ completed jobs — for the personal-bot use case that's acceptable; resubmit
 the URL.
 """
 
+import hashlib
 import logging
 import os
+import re
+import secrets
 import shutil
 import tempfile
 import threading
@@ -24,9 +27,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import requests
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
@@ -65,6 +69,190 @@ STATE_DONE = "done"
 STATE_FAILED = "failed"
 _TERMINAL_STATES = {STATE_DONE, STATE_FAILED}
 
+# Subsonic API client identifier; surfaced in Navidrome's audit log.
+_SUBSONIC_CLIENT = "musicdon"
+_SUBSONIC_API_VERSION = "1.16.1"
+_SUBSONIC_HTTP_TIMEOUT = 10  # seconds; Subsonic calls are tiny and synchronous
+_NAVIDROME_SHARE_RE = re.compile(r"/share/([A-Za-z0-9_-]+)")
+
+
+@dataclass(frozen=True)
+class NavidromeConfig:
+    """
+    Resolved Navidrome connection config, or None when disabled.
+
+    Loaded once at api-server startup from NAVIDROME_URL / NAVIDROME_USER /
+    NAVIDROME_PASSWORD. The Subsonic-compatible REST API at <url>/rest/* is
+    used for share resolution.
+    """
+
+    base_url: str
+    user: str
+    password: str
+
+
+def _navidrome_config() -> Optional[NavidromeConfig]:
+    url = (os.environ.get("NAVIDROME_URL") or "").strip().rstrip("/")
+    user = (os.environ.get("NAVIDROME_USER") or "").strip()
+    pw = os.environ.get("NAVIDROME_PASSWORD") or ""
+    if not url or not user or not pw:
+        return None
+    return NavidromeConfig(base_url=url, user=user, password=pw)
+
+
+def _subsonic_auth_params(cfg: NavidromeConfig) -> Dict[str, str]:
+    """
+    Build the Subsonic token-auth query params. A fresh salt is generated
+    per call so a captured request can't be replayed indefinitely.
+    """
+
+    salt = secrets.token_hex(8)
+    token = hashlib.md5((cfg.password + salt).encode("utf-8")).hexdigest()
+    return {
+        "u": cfg.user,
+        "t": token,
+        "s": salt,
+        "v": _SUBSONIC_API_VERSION,
+        "c": _SUBSONIC_CLIENT,
+        "f": "json",
+    }
+
+
+def _subsonic_get(cfg: NavidromeConfig, endpoint: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Call a Subsonic .view endpoint and return the parsed `subsonic-response`
+    body. Raises ValueError with the server-reported error on Subsonic-level
+    failures so callers can surface a human message.
+    """
+
+    qs = {**_subsonic_auth_params(cfg), **params}
+    url = f"{cfg.base_url}/rest/{endpoint}"
+    resp = requests.get(url, params=qs, timeout=_SUBSONIC_HTTP_TIMEOUT)
+    resp.raise_for_status()
+    payload = resp.json()
+    body = payload.get("subsonic-response") or {}
+    if body.get("status") != "ok":
+        err = body.get("error") or {}
+        raise ValueError(err.get("message") or f"subsonic {endpoint} failed")
+    return body
+
+
+def _navidrome_share_id_from_url(url: str) -> Optional[str]:
+    """Extract the share ID from a Navidrome share URL like .../share/<id>."""
+    m = _NAVIDROME_SHARE_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _navidrome_share_entries(cfg: NavidromeConfig, share_id: str) -> List[Dict[str, Any]]:
+    """
+    Resolve a share to its list of entries via getShare.view. The Subsonic
+    JSON quirk where single-element lists collapse to a dict is normalized
+    here so callers always get a List[Dict].
+    """
+
+    body = _subsonic_get(cfg, "getShare.view", {"id": share_id})
+    shares = (body.get("shares") or {}).get("share")
+    if not shares:
+        raise ValueError(f"share not found: {share_id}")
+    if isinstance(shares, dict):
+        shares = [shares]
+    if not shares:
+        raise ValueError(f"share not found: {share_id}")
+    entries = shares[0].get("entry")
+    if entries is None:
+        return []
+    if isinstance(entries, dict):
+        entries = [entries]
+    return [e for e in entries if isinstance(e, dict) and not e.get("isDir")]
+
+
+def _local_path_for_subsonic(
+    subsonic_path: str, settings: DownloaderOptions
+) -> Path:
+    """
+    Map a Subsonic `path` field (relative to Navidrome's library root) to a
+    filesystem path inside this container. Absolute paths are passed through
+    on the assumption Navidrome and api-server see the same root.
+    """
+
+    p = Path(subsonic_path)
+    if p.is_absolute():
+        return p
+    base = settings["output"].split("{", 1)[0].rstrip("/") or "."
+    return Path(base).expanduser() / subsonic_path
+
+
+def _read_woas(file_path: Path) -> Optional[str]:
+    """
+    Read the WOAS (Web Of Audio Source) frame from an MP3 file, which is
+    where we stash the Spotify URL when a track was paired with Spotify.
+    Returns None when the frame is absent or the file isn't an MP3.
+    """
+
+    if file_path.suffix.lower() != ".mp3":
+        return None
+    try:
+        from mutagen.id3 import ID3  # noqa: PLC0415
+        from mutagen.id3._util import ID3NoHeaderError  # noqa: PLC0415
+    except Exception:  # pylint: disable=broad-except
+        return None
+    try:
+        tags = ID3(str(file_path))
+    except ID3NoHeaderError:
+        return None
+    except Exception:  # pylint: disable=broad-except
+        return None
+    frames = tags.getall("WOAS")
+    if not frames:
+        return None
+    url = getattr(frames[0], "url", None) or ""
+    return url.strip() or None
+
+
+@dataclass
+class NavidromeTrack:
+    """One resolved entry from a Navidrome share."""
+
+    path: str
+    name: str
+    artist: str
+    spotify_url: Optional[str]
+
+
+def _resolve_navidrome_share(
+    share_url_or_id: str,
+    cfg: NavidromeConfig,
+    settings: DownloaderOptions,
+) -> List[NavidromeTrack]:
+    """
+    Turn a Navidrome share URL (or bare share ID) into a list of local file
+    paths annotated with the Spotify URL we recorded in WOAS at download
+    time. `spotify_url` is None for files that were never paired with Spotify
+    (e.g. a /skip'd manual upload).
+    """
+
+    share_id = (
+        _navidrome_share_id_from_url(share_url_or_id) or share_url_or_id.strip()
+    )
+    if not share_id:
+        raise ValueError("missing Navidrome share ID")
+    entries = _navidrome_share_entries(cfg, share_id)
+    tracks: List[NavidromeTrack] = []
+    for entry in entries:
+        sub_path = entry.get("path") or ""
+        if not sub_path:
+            continue
+        local = _local_path_for_subsonic(sub_path, settings)
+        tracks.append(
+            NavidromeTrack(
+                path=str(local),
+                name=str(entry.get("title") or "").strip() or local.stem,
+                artist=str(entry.get("artist") or "").strip() or "Unknown Artist",
+                spotify_url=_read_woas(local),
+            )
+        )
+    return tracks
+
 
 class SubmitRequest(BaseModel):
     """Body of POST /download."""
@@ -82,9 +270,10 @@ class EnrichResponse(BaseModel):
 
 
 class DeleteRequest(BaseModel):
-    """Body of POST /delete."""
+    """Body of POST /delete. Exactly one of `url` or `share_id` must be set."""
 
-    url: str
+    url: Optional[str] = None
+    share_id: Optional[str] = None
     confirm: bool = False
 
 
@@ -129,12 +318,14 @@ class LookupRequest(BaseModel):
 
 class LookupResult(BaseModel):
     """One resolved Spotify track. `error` is set when the lookup failed and
-    the other fields are empty."""
+    the other fields are empty. `in_library` reflects archive membership,
+    which is our proxy for "we've processed this URL before"."""
 
     url: str
     name: Optional[str] = None
     artist: Optional[str] = None
     artists: List[str] = []
+    in_library: bool = False
     error: Optional[str] = None
 
 
@@ -142,6 +333,44 @@ class LookupResponse(BaseModel):
     """Returned by POST /lookup."""
 
     results: List[LookupResult]
+
+
+class ResolveNavidromeRequest(BaseModel):
+    """Body of POST /resolve-navidrome."""
+
+    share_url: str
+
+
+class ResolveNavidromeTrack(BaseModel):
+    """One resolved entry from a Navidrome share."""
+
+    path: str
+    name: str
+    artist: str
+    spotify_url: Optional[str] = None
+
+
+class ResolveNavidromeResponse(BaseModel):
+    """Returned by POST /resolve-navidrome."""
+
+    share_id: str
+    tracks: List[ResolveNavidromeTrack]
+
+
+class AssociateRequest(BaseModel):
+    """Body of POST /associate. The share must resolve to exactly one track."""
+
+    share_url: str
+    spotify_url: str
+
+
+class AssociateResponse(BaseModel):
+    """Returned by POST /associate."""
+
+    path: str
+    spotify_url: str
+    song_name: str
+    song_artist: str
 
 
 class SubmitResponse(BaseModel):
@@ -318,16 +547,149 @@ def api_server(
 
     @app.post("/delete", response_model=DeleteResponse)
     def delete(req: DeleteRequest) -> DeleteResponse:
-        kind = _kind_from_url(req.url)
+        if bool(req.url) == bool(req.share_id):
+            raise HTTPException(
+                status_code=400,
+                detail="exactly one of `url` or `share_id` is required",
+            )
+        if req.share_id:
+            cfg = _navidrome_config()
+            if cfg is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Navidrome is not configured "
+                        "(NAVIDROME_URL/USER/PASSWORD)"
+                    ),
+                )
+            return _run_delete_navidrome(
+                req.share_id, req.confirm, downloader_settings, cfg
+            )
+        kind = _kind_from_url(req.url or "")
         if kind not in {"track", "album", "playlist"}:
             raise HTTPException(
                 status_code=400,
                 detail=f"unsupported URL kind for /delete: {kind!r}",
             )
-        return _run_delete(req.url, kind, req.confirm, downloader_settings)
+        return _run_delete(req.url or "", kind, req.confirm, downloader_settings)
+
+    @app.post("/resolve-navidrome", response_model=ResolveNavidromeResponse)
+    def resolve_navidrome(req: ResolveNavidromeRequest) -> ResolveNavidromeResponse:
+        cfg = _navidrome_config()
+        if cfg is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Navidrome is not configured (NAVIDROME_URL/USER/PASSWORD)",
+            )
+        share_id = _navidrome_share_id_from_url(req.share_url) or req.share_url.strip()
+        if not share_id:
+            raise HTTPException(
+                status_code=400, detail="missing Navidrome share ID"
+            )
+        try:
+            tracks = _resolve_navidrome_share(req.share_url, cfg, downloader_settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Navidrome unreachable: {exc}"
+            ) from exc
+        return ResolveNavidromeResponse(
+            share_id=share_id,
+            tracks=[
+                ResolveNavidromeTrack(
+                    path=t.path,
+                    name=t.name,
+                    artist=t.artist,
+                    spotify_url=t.spotify_url,
+                )
+                for t in tracks
+            ],
+        )
+
+    @app.post("/associate", response_model=AssociateResponse)
+    def associate(req: AssociateRequest) -> AssociateResponse:
+        cfg = _navidrome_config()
+        if cfg is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Navidrome is not configured (NAVIDROME_URL/USER/PASSWORD)",
+            )
+        if _kind_from_url(req.spotify_url) != "track":
+            raise HTTPException(
+                status_code=400,
+                detail="spotify_url must be a Spotify track URL",
+            )
+        try:
+            tracks = _resolve_navidrome_share(
+                req.share_url, cfg, downloader_settings
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Navidrome unreachable: {exc}"
+            ) from exc
+        if len(tracks) != 1:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"share resolves to {len(tracks)} tracks; "
+                    "/associate requires a single-track share"
+                ),
+            )
+        track = tracks[0]
+        file_path = Path(track.path)
+        if not file_path.exists():
+            raise HTTPException(
+                status_code=404, detail=f"file not found: {file_path}"
+            )
+        if file_path.suffix.lower() != ".mp3":
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported file format for /associate: {file_path.suffix}",
+            )
+
+        try:
+            song = Song.from_url(req.spotify_url)
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=400,
+                detail=f"failed to resolve Spotify URL: {exc}",
+            ) from exc
+
+        try:
+            _write_woas(file_path, req.spotify_url)
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to write WOAS tag: {exc}",
+            ) from exc
+
+        _add_to_archive(req.spotify_url, downloader_settings)
+        logger.info(
+            "associated %s with %s", file_path, req.spotify_url
+        )
+        return AssociateResponse(
+            path=str(file_path),
+            spotify_url=req.spotify_url,
+            song_name=song.name,
+            song_artist=song.artist,
+        )
 
     @app.post("/lookup", response_model=LookupResponse)
     def lookup(req: LookupRequest) -> LookupResponse:
+        # Snapshot the archive once per call so we can answer in_library
+        # without rereading the file for each URL. Acquiring the lock keeps
+        # us coherent with a concurrent download that's mid-save.
+        archive_path = downloader_settings.get("archive")
+        archive_urls: set = set()
+        if archive_path:
+            with _archive_lock:
+                arc = Archive()
+                arc.load(archive_path)
+                archive_urls = {u for u in arc}
+
         results: List[LookupResult] = []
         for url in req.urls:
             if _kind_from_url(url) != "track":
@@ -344,6 +706,7 @@ def api_server(
                     name=song.name,
                     artist=song.artist,
                     artists=list(song.artists),
+                    in_library=url in archive_urls,
                 )
             )
         return LookupResponse(results=results)
@@ -889,6 +1252,106 @@ def _run_delete(
         m3u_entries_stripped=stripped,
         errors=errors,
     )
+
+
+def _run_delete_navidrome(
+    share_id: str,
+    confirm: bool,
+    settings: DownloaderOptions,
+    cfg: NavidromeConfig,
+) -> DeleteResponse:
+    """
+    Delete-by-Navidrome-share: resolve the share to file paths, build delete
+    targets from those paths (no library WOAS scan needed), then on confirm
+    unlink the files, drop their WOAS-derived URLs from the archive, and
+    strip m3u references.
+    """
+
+    try:
+        tracks = _resolve_navidrome_share(share_id, cfg, settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Navidrome unreachable: {exc}"
+        ) from exc
+
+    targets: List[DeleteTarget] = []
+    for t in tracks:
+        targets.append(
+            DeleteTarget(
+                url=t.spotify_url or "",
+                path=t.path,
+                name=Path(t.path).stem,
+            )
+        )
+
+    if not confirm:
+        return DeleteResponse(
+            kind="navidrome",
+            targets=targets,
+            m3u_path=None,
+            count=len(targets),
+            confirmed=False,
+        )
+
+    deleted_count = 0
+    deleted_paths: List[str] = []
+    deleted_urls: List[str] = []
+    errors: List[str] = []
+    for t in targets:
+        try:
+            Path(t.path).unlink()
+            deleted_count += 1
+            deleted_paths.append(t.path)
+            if t.url:
+                deleted_urls.append(t.url)
+        except FileNotFoundError:
+            if t.url:
+                deleted_urls.append(t.url)
+        except OSError as exc:
+            errors.append(f"unlink {t.path}: {exc}")
+
+    if deleted_urls:
+        _archive_remove_many(deleted_urls, settings)
+
+    stripped = _strip_m3u_references(deleted_paths, settings)
+
+    logger.info(
+        "delete (navidrome): share=%s files=%d m3u_stripped=%d",
+        share_id,
+        deleted_count,
+        stripped,
+    )
+    return DeleteResponse(
+        kind="navidrome",
+        targets=targets,
+        m3u_path=None,
+        count=len(targets),
+        confirmed=True,
+        deleted_count=deleted_count,
+        m3u_entries_stripped=stripped,
+        errors=errors,
+    )
+
+
+def _write_woas(file_path: Path, spotify_url: str) -> None:
+    """
+    Overwrite the WOAS frame on an MP3 with `spotify_url`. Other tags are
+    preserved untouched. Used by /associate to retroactively bind a Spotify
+    track to an existing file without disturbing the user's chosen metadata.
+    """
+
+    from mutagen.id3 import ID3, WOAS  # noqa: PLC0415
+    from mutagen.id3._util import ID3NoHeaderError  # noqa: PLC0415
+
+    try:
+        tags = ID3(str(file_path))
+    except ID3NoHeaderError:
+        tags = ID3()
+    tags.delall("WOAS")
+    tags.add(WOAS(url=spotify_url))
+    tags.save(str(file_path))
 
 
 def _resolve_delete_scope(url: str, kind: str) -> List[str]:
