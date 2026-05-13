@@ -345,13 +345,30 @@ def _spotdl_canonical_path_for_entry(
     title = str(entry.get("title") or "").strip()
     if not title:
         return None
-    artist = str(entry.get("artist") or "").strip()
-    album_artist = str(
-        entry.get("albumArtist") or entry.get("artist") or ""
-    ).strip()
+
+    # Navidrome's openSubsonic schema returns the album-artist as
+    # `displayAlbumArtist` (string) or the first entry of `albumArtists`
+    # (list of {id,name}). The legacy `albumArtist` field is often absent.
+    # The plain `artist` field is the slash-joined display string for
+    # multi-artist tracks ("SALUKI/Вышел покурить"), which is NOT what
+    # spotdl uses for {album-artist} — that would synthesize a different
+    # filename than what's on disk.
+    album_artist = (
+        str(entry.get("displayAlbumArtist") or "").strip()
+        or str(entry.get("albumArtist") or "").strip()
+    )
+    if not album_artist:
+        album_artists = entry.get("albumArtists")
+        if isinstance(album_artists, list) and album_artists:
+            first = album_artists[0]
+            if isinstance(first, dict):
+                album_artist = str(first.get("name") or "").strip()
+    if not album_artist:
+        album_artist = str(entry.get("artist") or "").strip()
+
+    artist = str(entry.get("artist") or "").strip() or album_artist
     if not (artist or album_artist):
         return None
-    artist = artist or album_artist
     album_artist = album_artist or artist
     album = str(entry.get("album") or title).strip() or title
 
