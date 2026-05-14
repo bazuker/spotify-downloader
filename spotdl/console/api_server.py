@@ -42,7 +42,7 @@ from spotdl.types.song import Song
 from spotdl.utils.archive import Archive
 from spotdl.utils.formatter import create_file_name
 from spotdl.utils.metadata import embed_metadata, get_file_metadata
-from spotdl.utils.search import get_simple_songs
+from spotdl.utils.search import gather_known_songs, get_simple_songs
 
 __all__ = ["api_server"]
 
@@ -543,6 +543,14 @@ class AssociateResponse(BaseModel):
     song_artist: str
 
 
+class SyncRequest(BaseModel):
+    """Body of POST /sync — a list of Spotify track URLs from a YourLibrary
+    JSON export. The bot is responsible for parsing the export and
+    extracting URIs; the api-server only sees the URL list."""
+
+    urls: List[str]
+
+
 class SubmitResponse(BaseModel):
     """Returned by POST /download — the bot polls /jobs/{job_id} from here on."""
 
@@ -660,6 +668,23 @@ def api_server(
             target=_run_job,
             args=(job, downloader_settings),
             name=f"job-{job.id}",
+            daemon=True,
+        ).start()
+        return SubmitResponse(job_id=job.id, state=job.state)
+
+    @app.post("/sync", response_model=SubmitResponse, status_code=202)
+    def sync(req: SyncRequest) -> SubmitResponse:
+        if not req.urls:
+            raise HTTPException(status_code=400, detail="urls must not be empty")
+        try:
+            job = jobs.submit(f"library-sync ({len(req.urls)} tracks)")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        threading.Thread(
+            target=_run_sync_job,
+            args=(job, list(req.urls), downloader_settings),
+            name=f"sync-{job.id}",
             daemon=True,
         ).start()
         return SubmitResponse(job_id=job.id, state=job.state)
@@ -975,6 +1000,122 @@ def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
             job.state = STATE_DONE
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("job %s failed", job.id)
+        with job.lock:
+            job.state = STATE_FAILED
+            job.error = str(exc)
+    finally:
+        with job.lock:
+            job.finished_at = time.time()
+        if downloader is not None:
+            try:
+                downloader.progress_handler.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+
+def _run_sync_job(
+    job: Job, urls: List[str], base_settings: DownloaderOptions
+) -> None:
+    """
+    Worker thread body for a library-sync job. Pre-filters URLs against the
+    archive before hitting Spotify so re-syncs of a large library (the user
+    has 2000+ tracks) don't burn API calls on tracks we already have. New
+    tracks go through the standard get_simple_songs → download_multiple_songs
+    pipeline; spotipy handles 429 backoff for us.
+    """
+
+    downloader: Optional[Downloader] = None
+    try:
+        with job.lock:
+            job.kind = "sync"
+            job.state = STATE_RESOLVING
+
+        # Pre-filter URLs against everything we already have locally. Two
+        # sources:
+        #   1. The archive file: the flat list of URLs spotdl has processed.
+        #   2. The WOAS-tag scan of files on disk (same scan the Downloader
+        #      does when scan_for_songs is on, just pulled forward). This
+        #      catches files whose archive entry was lost or that landed in
+        #      the library via /associate / manual placement.
+        # Pulling both forward turns Spotify API usage from "one call per
+        # URL in the library export" to "one call per genuinely new track."
+        known_urls: set = set()
+        archive_path = base_settings.get("archive")
+        if archive_path:
+            with _archive_lock:
+                arc = Archive()
+                arc.load(archive_path)
+                known_urls.update(arc)
+
+        # gather_known_songs walks the output tree once and reads each
+        # MP3's WOAS tag; for a 2000-track library it's ~10-30s which is
+        # dwarfed by what we save in Spotify calls.
+        formats = base_settings.get("detect_formats") or [
+            base_settings["format"]
+        ]
+        for fmt in formats:
+            known_urls.update(
+                gather_known_songs(base_settings["output"], fmt).keys()
+            )
+
+        remaining = [u for u in urls if u not in known_urls]
+        pre_skipped = len(urls) - len(remaining)
+
+        with job.lock:
+            job.skipped = pre_skipped
+
+        if not remaining:
+            # Whole library already covered — nothing to do. Skip the
+            # Downloader entirely so we don't even initialize Spotify.
+            with job.lock:
+                job.total = 0
+                job.state = STATE_DONE
+            return
+
+        per_request: Dict[str, Any] = dict(base_settings)
+        # The library export isn't a playlist — no m3u to write.
+        per_request["m3u"] = None
+        downloader = Downloader(per_request)
+
+        # get_simple_songs accepts a list of URLs and resolves each one;
+        # each track URL is one Spotify API call. spotipy handles backoff
+        # transparently if we hit 429.
+        songs = get_simple_songs(
+            remaining,
+            use_ytm_data=downloader.settings["ytm_data"],
+            playlist_numbering=downloader.settings["playlist_numbering"],
+            albums_to_ignore=downloader.settings["ignore_albums"],
+            album_type=downloader.settings["album_type"],
+            playlist_retain_track_cover=downloader.settings[
+                "playlist_retain_track_cover"
+            ],
+        )
+
+        with job.lock:
+            job.total = len(songs)
+            job.state = STATE_DOWNLOADING
+
+        original_search_and_download = downloader.search_and_download
+
+        def tracked_search_and_download(song):
+            result = original_search_and_download(song)
+            with job.lock:
+                if result[1] is not None:
+                    job.downloaded += 1
+                else:
+                    job.errored += 1
+                    job.errored_tracks.append(song.display_name)
+            return result
+
+        downloader.search_and_download = tracked_search_and_download  # type: ignore[assignment]
+
+        results = downloader.download_multiple_songs(songs)
+
+        with job.lock:
+            job.paths = [str(p) for _s, p in results if p is not None]
+            job.state = STATE_DONE
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("sync job %s failed", job.id)
         with job.lock:
             job.state = STATE_FAILED
             job.error = str(exc)
@@ -1645,9 +1786,6 @@ def _find_files_for_urls(
 
     if not urls:
         return []
-
-    # Lazy import to avoid pulling search at module load time.
-    from spotdl.utils.search import gather_known_songs  # noqa: PLC0415
 
     formats = settings.get("detect_formats") or [settings["format"]]
     index: Dict[str, List[Path]] = {}
