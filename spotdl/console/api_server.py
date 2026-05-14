@@ -31,9 +31,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+import spotipy.client as _spotipy_client
+import urllib3.exceptions as _urllib3_exc
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from spotipy.exceptions import SpotifyException
 
 from spotdl.download.downloader import LYRICS_PROVIDERS, Downloader
 from spotdl.providers.audio.base import AudioProvider
@@ -47,6 +50,58 @@ from spotdl.utils.search import gather_known_songs, get_simple_songs
 __all__ = ["api_server"]
 
 logger = logging.getLogger(__name__)
+
+
+class _SpotifyFailFastRetry(_spotipy_client.Retry):
+    """Replacement for spotipy's default Retry that fails fast on HTTP 429
+    when Spotify's ``Retry-After`` says we'd block for more than a few minutes.
+
+    Spotify's daily-quota-exhausted responses carry a ``Retry-After`` of
+    ~16 hours (e.g. ``59986`` seconds). urllib3's stock behaviour is to
+    ``time.sleep`` for that long and *then* retry — which freezes a sync
+    worker thread for the full window. We'd rather raise
+    ``SpotifyException(429)`` immediately so the sync loop can break, hand
+    whatever was resolved off to the downloader, and report a partial sync
+    to the user. Small ``Retry-After`` values still get the normal retry
+    behaviour, so transient throttling for a per-call burst isn't broken.
+
+    The patch is applied below by reassigning ``_spotipy_client.Retry``;
+    spotipy's ``Spotify.__init__`` constructs its retry instance via the
+    ``Retry`` name local to ``spotipy.client``, so as long as we land
+    before ``SpotifyClient.init()`` runs (which entry_point.py calls
+    *after* importing this module), the new class takes effect.
+    """
+
+    _BAIL_THRESHOLD_SECONDS = 300
+
+    def increment(  # pylint: disable=too-many-arguments
+        self, method=None, url=None, response=None,
+        error=None, _pool=None, _stacktrace=None,
+    ):
+        if response is not None and response.status == 429:
+            retry_after_header = response.headers.get("Retry-After")
+            try:
+                retry_after = int(retry_after_header) if retry_after_header else 0
+            except (ValueError, TypeError):
+                retry_after = 0
+            if retry_after > self._BAIL_THRESHOLD_SECONDS:
+                logger.warning(
+                    "Spotify rate-limited with Retry-After=%ss; not waiting, "
+                    "raising MaxRetryError so the sync resolve loop can break.",
+                    retry_after,
+                )
+                raise _urllib3_exc.MaxRetryError(
+                    _pool, url or "",
+                    f"Spotify rate limit (Retry-After: {retry_after}s); fail-fast",
+                )
+        return super().increment(
+            method, url,
+            response=response, error=error,
+            _pool=_pool, _stacktrace=_stacktrace,
+        )
+
+
+_spotipy_client.Retry = _SpotifyFailFastRetry
 
 _KNOWN_KINDS = {"track", "album", "playlist", "artist"}
 _ARCHIVE_FILENAME = "musicdon.archive"
@@ -585,6 +640,7 @@ class JobStatus(BaseModel):
     paths: List[str] = []
     errored_tracks: List[str] = []
     error: Optional[str] = None
+    rate_limited: bool = False
 
 
 @dataclass
@@ -604,6 +660,7 @@ class Job:
     errored_tracks: List[str] = field(default_factory=list)
     error: Optional[str] = None
     cancelled: bool = False  # set True by POST /jobs/{id}/cancel; worker bails on next check
+    rate_limited: bool = False  # sync resolve loop hit Spotify quota and stopped early
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -940,6 +997,7 @@ def api_server(
                 paths=list(job.paths),
                 errored_tracks=list(job.errored_tracks),
                 error=job.error,
+                rate_limited=job.rate_limited,
             )
 
     @app.post("/jobs/{job_id}/cancel", status_code=202)
@@ -1137,8 +1195,31 @@ def _run_sync_job(
                 if job.cancelled:
                     raise JobCancelled()
             normalized = re.sub(r"\/intl-\w+\/", "/", url)
+            rate_limited = False
             try:
                 songs.append(Song.from_url(url=normalized))
+            except SpotifyException as exc:
+                # 429 here means Spotify's quota is exhausted (the
+                # _SpotifyFailFastRetry above re-raises with the original
+                # status). Stop resolving and proceed to download whatever
+                # we already have — the user can re-run /sync after the
+                # quota window resets; resolved tracks won't need a second
+                # Spotify call thanks to the archive pre-filter.
+                if exc.http_status == 429:
+                    logger.warning(
+                        "sync: Spotify rate limit at %d/%d; stopping resolve "
+                        "and proceeding with %d already-resolved %s",
+                        job.resolved + 1, len(remaining), len(songs),
+                        "song" if len(songs) == 1 else "songs",
+                    )
+                    with job.lock:
+                        job.rate_limited = True
+                    rate_limited = True
+                else:
+                    logger.warning("sync: skipping %s: %s", url, exc)
+                    with job.lock:
+                        job.errored += 1
+                        job.errored_tracks.append(url)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("sync: skipping %s: %s", url, exc)
                 with job.lock:
@@ -1146,6 +1227,8 @@ def _run_sync_job(
                     job.errored_tracks.append(url)
             with job.lock:
                 job.resolved += 1
+            if rate_limited:
+                break
 
         with job.lock:
             # Re-set total to the actually-resolved song count so the
