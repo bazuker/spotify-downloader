@@ -34,6 +34,7 @@ import requests
 import spotipy.client as _spotipy_client
 import urllib3.exceptions as _urllib3_exc
 import uvicorn
+from urllib3.exceptions import ResponseError as _Urllib3ResponseError
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from spotipy.exceptions import SpotifyException
@@ -90,9 +91,17 @@ class _SpotifyFailFastRetry(_spotipy_client.Retry):
                     "raising MaxRetryError so the sync resolve loop can break.",
                     retry_after,
                 )
+                # `reason` MUST be a ResponseError instance, not a string —
+                # requests' HTTPAdapter checks `isinstance(e.reason, ResponseError)`
+                # to decide between wrapping as RetryError (which spotipy then
+                # remaps to SpotifyException(429)) vs. a plain ConnectionError
+                # (which spotipy doesn't recognize, so it propagates raw and
+                # the resolve loop's `except SpotifyException` never fires).
                 raise _urllib3_exc.MaxRetryError(
                     _pool, url or "",
-                    f"Spotify rate limit (Retry-After: {retry_after}s); fail-fast",
+                    _Urllib3ResponseError(
+                        f"Spotify rate limit (Retry-After: {retry_after}s); fail-fast"
+                    ),
                 )
         return super().increment(
             method, url,
