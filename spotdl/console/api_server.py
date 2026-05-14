@@ -1020,8 +1020,9 @@ def _run_sync_job(
     Worker thread body for a library-sync job. Pre-filters URLs against the
     archive before hitting Spotify so re-syncs of a large library (the user
     has 2000+ tracks) don't burn API calls on tracks we already have. New
-    tracks go through the standard get_simple_songs → download_multiple_songs
-    pipeline; spotipy handles 429 backoff for us.
+    tracks are resolved one-by-one via Song.from_url (so a single removed
+    track doesn't fail the whole job) and then handed to download_multiple_songs;
+    spotipy handles 429 backoff for us.
     """
 
     downloader: Optional[Downloader] = None
@@ -1077,23 +1078,34 @@ def _run_sync_job(
         per_request["m3u"] = None
         downloader = Downloader(per_request)
 
-        # get_simple_songs accepts a list of URLs and resolves each one;
-        # each track URL is one Spotify API call. spotipy handles backoff
-        # transparently if we hit 429.
-        songs = get_simple_songs(
-            remaining,
-            use_ytm_data=downloader.settings["ytm_data"],
-            playlist_numbering=downloader.settings["playlist_numbering"],
-            albums_to_ignore=downloader.settings["ignore_albums"],
-            album_type=downloader.settings["album_type"],
-            playlist_retain_track_cover=downloader.settings[
-                "playlist_retain_track_cover"
-            ],
-        )
+        # Resolve URLs one at a time so a single dead track (e.g. removed
+        # from Spotify, 404 → SongError) doesn't take down the whole sync.
+        # All URLs here are Spotify track URLs from a YourLibrary export,
+        # so we don't need the full get_simple_songs dispatch — Song.from_url
+        # is the same call its track branch would make. spotipy handles 429
+        # backoff transparently.
+        songs: List[Song] = []
+        for url in remaining:
+            normalized = re.sub(r"\/intl-\w+\/", "/", url)
+            try:
+                songs.append(Song.from_url(url=normalized))
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("sync: skipping %s: %s", url, exc)
+                with job.lock:
+                    job.errored += 1
+                    job.errored_tracks.append(url)
 
         with job.lock:
             job.total = len(songs)
             job.state = STATE_DOWNLOADING
+
+        if not songs:
+            # Every remaining URL failed to resolve. Don't kick off the
+            # downloader with an empty list — just finish the job. The
+            # errored_tracks count surfaces in the bot's summary.
+            with job.lock:
+                job.state = STATE_DONE
+            return
 
         original_search_and_download = downloader.search_and_download
 
