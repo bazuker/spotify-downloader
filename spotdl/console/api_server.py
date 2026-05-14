@@ -67,7 +67,19 @@ STATE_RESOLVING = "resolving"
 STATE_DOWNLOADING = "downloading"
 STATE_DONE = "done"
 STATE_FAILED = "failed"
-_TERMINAL_STATES = {STATE_DONE, STATE_FAILED}
+STATE_CANCELLED = "cancelled"
+_TERMINAL_STATES = {STATE_DONE, STATE_FAILED, STATE_CANCELLED}
+
+
+class JobCancelled(Exception):
+    """Raised inside a worker thread when job.cancelled is observed True.
+
+    The exception unwinds the worker out of whatever loop / spotdl call it's
+    in and is caught by the outer try in _run_job / _run_sync_job, which then
+    sets state to STATE_CANCELLED. Distinguishing this from a generic
+    Exception keeps cancellation out of STATE_FAILED (and out of the user's
+    error summary).
+    """
 
 # Subsonic API client identifier; surfaced in Navidrome's audit log.
 _SUBSONIC_CLIENT = "musicdon"
@@ -567,6 +579,7 @@ class JobStatus(BaseModel):
     state: str
     total: Optional[int] = None
     downloaded: int = 0
+    resolved: int = 0
     errored: int = 0
     skipped: int = 0
     paths: List[str] = []
@@ -584,11 +597,13 @@ class Job:
     state: str = STATE_QUEUED
     total: Optional[int] = None
     downloaded: int = 0
+    resolved: int = 0  # how many URLs have been turned into Song objects (sync resolve phase)
     errored: int = 0
     skipped: int = 0  # already-archived tracks; not counted against `total`
     paths: List[str] = field(default_factory=list)
     errored_tracks: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    cancelled: bool = False  # set True by POST /jobs/{id}/cancel; worker bails on next check
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -919,12 +934,31 @@ def api_server(
                 state=job.state,
                 total=job.total,
                 downloaded=job.downloaded,
+                resolved=job.resolved,
                 errored=job.errored,
                 skipped=job.skipped,
                 paths=list(job.paths),
                 errored_tracks=list(job.errored_tracks),
                 error=job.error,
             )
+
+    @app.post("/jobs/{job_id}/cancel", status_code=202)
+    def cancel_job(job_id: str) -> Dict[str, Any]:
+        """Flag a job for cancellation. The worker thread observes the flag
+        at well-defined checkpoints (resolve-loop iteration, per-song wrap)
+        and unwinds via JobCancelled, transitioning state to "cancelled".
+        Returns immediately — terminal transition is async; the caller polls
+        /jobs/{id} to see it. Idempotent: cancelling a finished or already-
+        cancelled job is a no-op success."""
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        with job.lock:
+            if job.is_terminal():
+                return {"cancelled": False, "state": job.state}
+            job.cancelled = True
+        logger.info("job %s cancel requested", job_id)
+        return {"cancelled": True, "state": job.state}
 
     host = server_settings.get("host") or "0.0.0.0"
     port = int(server_settings.get("port") or 8800)
@@ -978,10 +1012,15 @@ def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
 
         # `search_and_download` is the per-song synchronous worker called
         # from each pool_download coroutine. Wrapping it gives us per-track
-        # progress without reimplementing spotdl's orchestrator.
+        # progress without reimplementing spotdl's orchestrator. We also
+        # check job.cancelled here — raising JobCancelled out of the wrapper
+        # propagates through download_multiple_songs and is caught below.
         original_search_and_download = downloader.search_and_download
 
         def tracked_search_and_download(song):
+            with job.lock:
+                if job.cancelled:
+                    raise JobCancelled()
             result = original_search_and_download(song)
             with job.lock:
                 if result[1] is not None:
@@ -998,6 +1037,10 @@ def _run_job(job: Job, base_settings: DownloaderOptions) -> None:
         with job.lock:
             job.paths = [str(p) for _s, p in results if p is not None]
             job.state = STATE_DONE
+    except JobCancelled:
+        logger.info("job %s cancelled", job.id)
+        with job.lock:
+            job.state = STATE_CANCELLED
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("job %s failed", job.id)
         with job.lock:
@@ -1083,9 +1126,16 @@ def _run_sync_job(
         # All URLs here are Spotify track URLs from a YourLibrary export,
         # so we don't need the full get_simple_songs dispatch — Song.from_url
         # is the same call its track branch would make. spotipy handles 429
-        # backoff transparently.
+        # backoff transparently. We expose progress via job.resolved/total
+        # so the bot can show "Resolving N/M..." instead of a silent stare.
+        with job.lock:
+            job.total = len(remaining)
+
         songs: List[Song] = []
         for url in remaining:
+            with job.lock:
+                if job.cancelled:
+                    raise JobCancelled()
             normalized = re.sub(r"\/intl-\w+\/", "/", url)
             try:
                 songs.append(Song.from_url(url=normalized))
@@ -1094,8 +1144,13 @@ def _run_sync_job(
                 with job.lock:
                     job.errored += 1
                     job.errored_tracks.append(url)
+            with job.lock:
+                job.resolved += 1
 
         with job.lock:
+            # Re-set total to the actually-resolved song count so the
+            # download phase's progress math is correct (errored URLs
+            # shouldn't inflate the denominator).
             job.total = len(songs)
             job.state = STATE_DOWNLOADING
 
@@ -1110,6 +1165,9 @@ def _run_sync_job(
         original_search_and_download = downloader.search_and_download
 
         def tracked_search_and_download(song):
+            with job.lock:
+                if job.cancelled:
+                    raise JobCancelled()
             result = original_search_and_download(song)
             with job.lock:
                 if result[1] is not None:
@@ -1126,6 +1184,10 @@ def _run_sync_job(
         with job.lock:
             job.paths = [str(p) for _s, p in results if p is not None]
             job.state = STATE_DONE
+    except JobCancelled:
+        logger.info("sync job %s cancelled", job.id)
+        with job.lock:
+            job.state = STATE_CANCELLED
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("sync job %s failed", job.id)
         with job.lock:
